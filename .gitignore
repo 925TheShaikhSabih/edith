@@ -1,0 +1,11 @@
+# Secrets — never commit these
+.env
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Later tiers will add: memory store, logs, audio scratch files

@@ -1,0 +1,65 @@
+# On Termux (Android) specifically: run this FIRST, before pip install:
+#   pkg install python-cryptography
+#   pkg install -y clang rust make pkg-config libffi openssl
+#   export ANDROID_API_LEVEL="$(getprop ro.build.version.sdk)"
+# google-genai's dependency chain pulls in packages with native Rust code:
+#   - cryptography (via google-auth): Termux DOES have a prebuilt package
+#     for this (python-cryptography) — install it via pkg and pip will see
+#     the requirement already satisfied, skipping the source build.
+#   - pydantic-core (via pydantic, a REQUIRED direct dependency of
+#     google-genai itself): Termux does NOT have a prebuilt package for
+#     this under any name (confirmed: `pkg search pydantic` returns
+#     nothing). Prebuilt wheels from PyPI are also NOT usable — they're
+#     tagged for standard Linux (manylinux/glibc), while Termux's own pip
+#     only accepts Android-specific tags (confirmed via `pip debug
+#     --verbose`: tags like cp313-cp313-android_24_arm64_v8a, nothing
+#     "linux" at all) — this is a real, structural platform-tag mismatch,
+#     not a naming issue, and no clean prebuilt-wheel path was found.
+#     What DOES work: building from source with Termux's own native Rust
+#     toolchain (via `pkg install rust`, NOT rustup — rustup's installer
+#     doesn't recognize Termux's target triple) plus the ANDROID_API_LEVEL
+#     env var, which Rust/maturin-based Android builds need to know which
+#     API level to target. Confirmed working via this exact combination.
+#     Expect this build to take several minutes.
+# This is a well-documented, common pattern for ANY Python project on
+# Termux with a dependency chain reaching pydantic and/or cryptography —
+# not something specific to this project.
+# On a normal Linux/Mac/Windows machine, none of this is needed — pip
+# finds prebuilt wheels for these there without any extra step.
+
+google-genai>=1.0.0
+# ^ also covers edith/live_explore.py's client.aio.live surface — this is
+# a standard property of the same package (confirmed directly via the
+# SDK's own submodule docs: async_client.live: AsyncLive, listed
+# alongside .chats/.models/.files), NOT a separate package or version
+# requirement. gemini-3.1-flash-live-preview (used in live_explore.py) is
+# confirmed as the current model name via Google's own dedicated
+# "Get started with Gemini Live API" page.
+python-dotenv>=1.0.0
+websockets>=13.0
+elevenlabs>=1.0.0
+
+# --- OPTIONAL: local/offline voice alternatives (main_voice_local.py) ---
+# Only needed if trying the fully-offline Vosk+Piper path instead of
+# Deepgram+ElevenLabs. NOT required for main.py or main_voice.py.
+#
+# GENUINE, UNRESOLVED RISK on Termux specifically: both packages' PyPI
+# wheels are tagged for standard glibc Linux (manylinux2014_aarch64 for
+# vosk; manylinux_2_17/manylinux2014 for piper-tts), NOT Termux's actual
+# android_*_arm64_v8a tag family (confirmed via `pip debug --verbose`
+# earlier in this project). This may hit the same platform-tag wall
+# pydantic_core did — that took real investigation to resolve (see the
+# Termux dependency notes in AGENT.md), and vosk/piper-tts may need
+# similar treatment, or may simply not have a working install path on
+# Termux at all. This is genuinely untested as of being added here — try
+# installing these two ALONE first, separately from the rest of this
+# file, to isolate whether this risk materializes before assuming
+# anything else is wrong if it fails.
+vosk>=0.3.45
+piper-tts>=1.4.0
+
+# --- Hosting layer (server/main.py) ---
+# Only needed to run/deploy the server; not needed for main.py, main_voice.py,
+# main_voice_local.py, or live_explore.py on their own.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
