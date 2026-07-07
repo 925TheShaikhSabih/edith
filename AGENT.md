@@ -937,3 +937,34 @@ writing any code — same interview-first discipline as Tier 0.
 3. Test with a plain WebSocket client BEFORE building any UI — isolates
    hosting bugs from frontend bugs.
 Settle auth (who can connect) before step 1's code, not after.
+
+## Hosting: Render asked for a card (known issue, not user error)
+
+Render's own docs and most sources say no card needed, but a real,
+matching report exists in Render's own community forum (a user hitting
+the identical "payment information required" wall) — this is a known,
+inconsistent gap between Render's stated and actual signup flow, not
+something done wrong.
+Checked Railway and Fly.io as alternatives: BOTH now run on
+trial/usage-based credit models, not permanent free tiers, per multiple
+2026 sources including one explicit "2026 Update" flagging this change.
+Neither is a real fix for "always free."
+PythonAnywhere is the one option confirmed free without a card across
+sources — but WebSocket support there is UNVERIFIED, worth checking
+before committing time. Start here next: confirm PythonAnywhere
+actually supports WebSocket connections for server/main.py before
+attempting to deploy there.
+
+## Vercel: checked, real capability, wrong fit
+
+Vercel's own current WebSocket doc (June 2026) confirms native WebSocket
+support now exists for Python/FastAPI — contradicts some older
+competitor blog posts saying "no WebSocket support," which were likely
+describing a past state. BUT Vercel's serverless model means each
+message could hit a DIFFERENT function instance (own docs: "not
+guaranteed to reach the same Vercel Function instance"), which would
+silently drop server/main.py's per-session Brain instance mid-
+conversation — Vercel's own fix is external Redis, real added
+infrastructure, not free. Wrong fit for this server's design as-is.
+Sticking with PythonAnywhere as the next thing to verify (see prior
+note) rather than Vercel.
