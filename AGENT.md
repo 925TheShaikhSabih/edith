@@ -968,3 +968,205 @@ conversation — Vercel's own fix is external Redis, real added
 infrastructure, not free. Wrong fit for this server's design as-is.
 Sticking with PythonAnywhere as the next thing to verify (see prior
 note) rather than Vercel.
+
+## Vercel: confirmed dead end for Python WebSockets
+
+"Connection refused" traced to Vercel's WebSocket feature being gated
+behind an account-level permission ("Permissions Required: WebSockets")
+that doesn't appear as a self-service toggle in project settings (user
+confirmed: Fluid compute was on, no WebSockets setting found anywhere).
+Fetched Vercel's own dedicated WebSocket doc directly — its metadata
+shows last_updated: 2018-10-20, and EVERY code example on it (ws,
+Express, Hono, Socket.IO, Nitro, Next.js) is JavaScript/TypeScript. No
+Python example exists on this page at all, despite a one-line claim
+elsewhere ("FastAPI also work with WebSockets") that isn't backed up
+here. CONCLUSION: Vercel's WebSocket support is built/demonstrated for
+Node.js, not Python — not something fixable via more config from our
+side. Vercel is now also ruled out. Genuinely free, always-on Python
+WebSocket hosting doesn't have a clean answer among the platforms
+checked so far (Render: card-gated for some accounts; Railway/Fly.io:
+trial-credit models, not permanent free; PythonAnywhere: free tier
+explicitly excludes ASGI/WebSocket apps per their own docs; Vercel:
+WebSockets are Node-oriented and permission-gated).
+Real remaining options next time: retry Render (the card ask may be
+account-specific — some users report not hitting it); or accept a small
+one-time/low cost on a platform actually built for persistent Python
+processes (Fly.io's now-paid tier, a cheap VPS, etc.) — see the earlier
+"proceed" decision where a tiny cost was already accepted as reasonable.
+
+## Additional confirmation: no Start Command field on Vercel
+
+User clarified there's no Start Command field at all in Vercel's deploy
+settings (only Build Command) — confirms the WebSocket dead-end
+conclusion above from a second angle: Vercel doesn't run persistent
+processes at all (serverless, invoke-per-request), so there's no
+"keep uvicorn running" concept to expose a Start Command for. This
+isn't a missing setting to find — it's structural. Two independent
+signals (the WebSocket permission gate + no persistent-process model)
+now confirm Vercel is not viable for this server as designed. Stop
+trying to configure around it; move to Render retry or a paid VPS/PaaS
+per the prior note.
+
+## Correction: Vercel is NOT confirmed Node-only for WebSockets
+
+Retracting the earlier "Vercel WebSockets are Node-oriented, Python
+unsupported" conclusion — that was wrong, based on conflating two
+different Vercel doc pages. The user correctly quoted real Vercel docs:
+"Python frameworks like FastAPI also work with WebSockets on Vercel
+Functions... Add a WebSocket library (websockets, wsproto, or just
+uvicorn[standard])" — this IS real, current Vercel documentation
+(appears to live on the Python Runtime doc page, not the general
+WebSockets doc page fetched earlier, which is Node-focused but doesn't
+mean Python is unsupported).
+What's STILL confirmed and unresolved: the general WebSockets doc page
+(vercel.com/docs/functions/websockets) shows "🔒 Permissions Required:
+WebSockets" directly under the title, on every fetch. This gate is real
+and account-level, not project-settings-level — user confirmed no
+toggle exists in project settings despite Fluid compute being on. HOW to
+actually request/unlock this permission is the genuine open question —
+not whether Python is supported. Next step: look specifically for how
+to request this permission (likely via Vercel support, a dashboard
+banner, or account upgrade) rather than debug FastAPI compatibility
+further, since that part is not actually in question.
+
+## RESOLVED: the whole Vercel "connection refused" saga was a URL typo
+
+After chasing WebSocket permissions, Fluid compute, and Node-vs-Python
+support theories (several dead ends recorded above, one of which — "Vercel
+WebSockets are Node-only" — was flat-out WRONG and later retracted), the
+actual cause was simple: the WebSocket client was connecting to
+`https://edith-flame.vercel.app/` (wrong protocol — https instead of wss;
+wrong path — root instead of /ws) instead of the correct
+`wss://edith-flame.vercel.app/ws`. CONFIRMED WORKING once the correct URL
+was used.
+Lesson for next time: when a connection is refused, check the exact
+client URL (protocol + path) FIRST, before escalating to platform-level
+theories. Several messages of legitimate-sounding research (permissions
+gates, persistent-process models, Node-vs-Python docs) were spent before
+this simple check happened — worth doing cheap, boring checks before
+expensive research ones.
+VERCEL DEPLOYMENT NOW CONFIRMED WORKING for this server, including
+WebSockets, Python/FastAPI, Fluid compute — for real, on the actual
+deployed edith-flame.vercel.app. The earlier session-instance-dropping
+risk (per Vercel's own docs on "not guaranteed to reach the same
+instance") remains a real, unresolved, untested risk for LONGER
+conversations specifically — the instance_id check only confirmed
+stability across quick page refreshes so far, not across an extended,
+multi-message WebSocket session. Worth testing a longer back-and-forth
+conversation next, watching for a Brain instance silently resetting
+mid-conversation.
+
+## Frontend: JARVIS/Homecoming HUD (built, visually validated via static preview)
+
+frontend/src/EdithHUD.jsx — real React component, connects to the deployed
+WebSocket server, styled per Spider-Man: Homecoming's E.D.I.T.H. HUD
+specifically (not generic "AI dashboard"). Design plan per the
+frontend-design skill's process: named palette (void #0A0A0C, steel
+#3D4147, glow #00D4FF, stark-red #C4001A, paper #E8E8E8), radial/circular
+layout instead of chat bubbles, signature element = a reactive glowing
+core ring with tick-mark instrumentation.
+VALIDATION METHOD: since this sandbox can't run a full React build, built
+a static-HTML proof of the same visual logic, rendered it with
+wkhtmltoimage, and ACTUALLY LOOKED at the screenshots before calling
+anything done — caught and fixed two real problems this way that would
+have shipped unnoticed otherwise:
+  1. CSS text-shadow/box-shadow barely registered as a glow in render —
+     replaced with a real SVG filter (feGaussianBlur + feMerge), confirmed
+     via a focused isolated test image before rolling into the full design.
+  2. Centered stacked "E.D.I.T.H." label read as a logo lockup, disconnected
+     from the ring — moved to an arc-integrated textPath sitting ON the
+     ring geometry, more authentic to real HUD instrumentation. This left
+     the core's center empty, caught in a close-up crop, fixed by adding a
+     small diagnostic readout line ("LINK STABLE"/"SESSION ...") rather
+     than leaving it bare.
+Ported the validated static-preview choices into the real .jsx afterward.
+NOT YET DONE: an actual `npm install && npm run build` / real browser
+render of EdithHUD.jsx itself — the static preview proves the VISUAL
+LOGIC, not that this exact React file compiles and behaves identically
+in a real build. Structural brace/paren balance checked only, not a real
+JSX compile. Test this for real (locally, `npm create vite` + drop this
+component in) before assuming it's deploy-ready.
+
+## Frontend: CONFIRMED WORKING END-TO-END (real React build, real WebSocket)
+
+Tested on playcode.io (a real React sandbox), closing the one gap flagged
+at the end of the last frontend session: EdithHUD.jsx now confirmed to
+actually compile in a real React environment (not just structurally
+balanced braces/parens), renders correctly (matching the visually-
+validated static preview), and successfully connects to the real,
+deployed wss://edith-flame.vercel.app/ws server — receiving and
+displaying an actual Brain response. Full chain now proven live: React
+UI -> WebSocket -> Vercel-hosted FastAPI server -> Brain -> Gemini ->
+reply back to the browser. This is the JARVIS-in-the-cloud goal from
+several sessions ago, genuinely realized end-to-end.
+
+## Next up: voice over the browser (not started, scoped for next session)
+
+Frontend currently only sends/receives TEXT over the WebSocket
+(EdithHUD.jsx -> server/main.py -> Brain.send(), text only). Adding real
+browser voice needs, concretely:
+1. Browser mic capture via the MediaRecorder API in EdithHUD.jsx,
+   producing audio chunks (verify actual output format/codec first,
+   same "check before assuming" discipline as ears.py's M4A discovery).
+2. A new WebSocket message type carrying audio bytes (not just plain
+   text) - server/main.py's websocket_endpoint needs to distinguish text
+   vs. audio messages and route audio into Deepgram or Live's audio path
+   instead of straight to Brain.send().
+3. Audio OUT: server sends synthesized speech bytes back; browser plays
+   them (Web Audio API), a genuinely different mechanism than
+   termux-media-player.
+Start here next: confirm MediaRecorder's actual output format in a real
+browser FIRST (small, isolated test), before touching server/main.py -
+same lesson as every audio format mismatch hit earlier in this project.
+
+## Browser voice over Gemini Live (built, genuinely untested — real audio APIs involved)
+
+Built per explicit choice: Live over Deepgram/ElevenLabs for the browser
+specifically, since Live was already the most functionally complete
+proven voice path and is free under the existing Gemini key (an explicit
+"always free" priority) rather than adding a third/fourth provider.
+
+SERVER: server/main.py gained a new /ws/live endpoint, alongside the
+untouched /ws text endpoint. Ported directly from live_explore.py's
+CONFIRMED-WORKING Live logic (same model, same tool registry, same
+send_client_content/turn_complete pattern, same response={"result":...}
+tool-response shape) — not re-derived, specifically to avoid
+reintroducing bugs that took real debugging to resolve there. Swaps
+Termux-specific I/O (mic recording via termux-microphone-record,
+playback via termux-media-player) for binary WebSocket frames to/from
+the browser. Protocol: client sends binary PCM chunks (16kHz) then a
+text "END_TURN" signal; server replies with JSON control messages
+interleaved with one binary PCM frame (24kHz) per turn.
+
+BROWSER: EdithHUD.jsx gained a separate "Live Voice" panel (connect,
+then press-to-record/stop-to-send — turn-based, not continuous).
+REAL RESEARCH FINDING, applied proactively: MediaRecorder (the obvious
+first choice) CANNOT produce raw PCM at all — confirmed via multiple
+independent sources — only compressed formats. Same category of problem
+as termux-microphone-record only producing AAC/M4A, not raw PCM,
+which needed ffmpeg to bridge. The browser equivalent fix is
+AudioWorklet (a low-level, separate-thread audio processing API) doing
+the Float32-to-Int16 PCM conversion directly, loaded as a Blob URL
+(worklets must be separate modules, confirmed via research) so the
+whole component stays self-contained for single-file test environments
+like PlayCode. Playback of the 24kHz reply uses the Web Audio API
+(AudioBuffer + BufferSource), converting PCM back to Float32 the other
+direction.
+
+VERIFICATION STATUS — explicitly the least-proven part of this whole
+project so far: no network access in the environment that built this,
+so NEITHER the new /ws/live server endpoint NOR the AudioWorklet/Web
+Audio browser code has been run for real, on any device, at all. This
+is fundamentally different from every other "untested" note in this
+file — those were built on top of proven pipelines with only integration
+untested; this involves a new, unverified server endpoint AND new,
+unverified low-level browser audio APIs simultaneously. Test on
+PlayCode (or a real deployed build) next, and expect real bugs — same
+likelihood as every other first attempt at a new audio pipeline in this
+project (ears.py's M4A/PCM mismatch, the async-recording race condition,
+etc.). Start by checking: does the AudioWorklet actually load and
+produce audio data at all (console.log the worklet's port messages
+before worrying about correctness); does the server's /ws/live endpoint
+even accept a connection; does audio format matching hold up
+(16kHz in, 24kHz out — this exact rate mismatch has caused real bugs
+before in this project, watch for it here too).
