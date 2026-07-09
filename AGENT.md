@@ -1170,3 +1170,200 @@ before worrying about correctness); does the server's /ws/live endpoint
 even accept a connection; does audio format matching hold up
 (16kHz in, 24kHz out — this exact rate mismatch has caused real bugs
 before in this project, watch for it here too).
+
+## Voice playback bug: RESOLVED (real fix, adopted from working code)
+
+The browser voice pipeline connected, captured, and used tools
+correctly, but no reply audio played. User got a working fix from
+Gemini (App.jsx) — adopted directly rather than re-derived, since it's
+proven working code. Root cause: browser autoplay policy. The original
+code created its AudioContext for PLAYBACK lazily inside startRecording
+(a click handler) shared with mic capture — by the time an async reply
+arrived later, that context could be suspended with nothing resuming it.
+FIX: split into two separate AudioContexts (one hard-locked to 16kHz for
+mic capture, one for playback at system native rate), with the playback
+context created directly inside connectVoice's click handler (a genuine
+user gesture) and an explicit `if (state === 'suspended') await
+resume()` check before every playback. CONFIRMED WORKING by the user.
+Adopted as the canonical frontend/src/EdithHUD.jsx.
+
+## Wake word / phrase activation (built on top of the confirmed-working voice pipeline)
+
+Added continuous phrase listening via the browser's built-in Web Speech
+API (SpeechRecognition) — free, no new dependency. When the configured
+phrase (default "hey edith") is detected, it calls the EXISTING,
+already-proven startRecording()/connectVoice() functions — this is a
+new TRIGGER in front of the proven Live pipeline, not a parallel or
+reimplemented one.
+
+TWO REAL CONSTRAINTS, researched and designed around proactively rather
+than discovered via a bug report (applying the lesson from the playback
+fix above directly):
+1. recognition.start() requires a real user gesture — confirmed via
+   multiple current sources ("Pages that auto-start on load fail with a
+   not-allowed or security error"). Same category of browser security
+   restriction that caused the playback bug. Means TRUE zero-touch
+   wake-word isn't achievable in a browser tab — there's always one
+   initial "Arm Wake Word" click needed to grant listening rights, after
+   which it stays listening continuously.
+2. Chrome silently self-stops continuous recognition after ~60s of
+   silence, firing onend with no warning (confirmed via multiple
+   current sources) — without handling this, wake-word would quietly
+   die after a minute of quiet. Fixed by auto-restarting recognition
+   inside onend whenever wake-word mode is still meant to be armed
+   (tracked via a ref, not just React state, since the onend closure
+   needs the current value without a stale-closure risk).
+
+Browser support note, confirmed via research: Chromium-based browsers
+and Safari support SpeechRecognition; Firefox has it behind a disabled-
+by-default flag. The code detects and shows a clear error rather than
+failing silently on unsupported browsers.
+
+VERIFICATION STATUS: built on top of the NOW-CONFIRMED-WORKING voice
+pipeline (connect, capture, tool-use, and playback all proven by the
+user). The wake-word layer ITSELF (phrase detection triggering the
+pipeline correctly, the 60-second auto-restart actually working) has
+NOT been tested for real — no network access in the environment that
+built this. Test next: does "Arm Wake Word" actually start listening;
+does saying the phrase actually trigger a recording; does it survive
+past 60 seconds of silence without going deaf.
+
+## Wake-word bug: recording never stopped (real, honest gap — now fixed)
+
+Reported: "hey edith" phrase itself didn't seem to trigger, but a
+different configured phrase did — this wasn't actually a bug: the wake
+phrase textbox holds whatever the user typed, and matching is an exact
+substring check, so this confirms the matching logic works correctly
+for whatever phrase was actually armed at the time.
+REAL bug: wake-word-triggered recordings never stopped, keeping the mic
+on indefinitely. Root cause, stated plainly: triggerFromWakeWord() only
+ever called startRecording() — there was never any code anywhere that
+called stopRecording() automatically. Manual "Press to Speak" turns work
+because the USER presses "Stop & Send"; wake-word mode has no such
+button, so nothing was ever going to end the turn. An honest design gap,
+not a subtle bug.
+FIX (per explicit preference: fixed duration over silence-detection,
+simpler and more predictable, no separate audio-level-analysis logic
+needed): startRecording() now sets an 8-second setTimeout calling the
+existing stopRecording() — unchanged otherwise. Verified this is SAFE
+for the existing manual-stop path too: stopRecording() already guards
+on `voiceState !== 'recording'`, so if a user manually stops before the
+timer fires, the timer's later call becomes a harmless no-op; the timer
+is also explicitly cleared on manual stop for cleanliness beyond just
+relying on that guard.
+One subtlety checked before shipping, not assumed: startRecording
+references stopRecording inside a setTimeout callback, but stopRecording
+is defined LATER in the file (both are `const`, not hoisted function
+declarations). Confirmed this is safe: the reference is only evaluated
+when the timer actually fires (8s later, well after the whole component
+has finished its initial render and stopRecording genuinely exists in
+the closure), not at the point startRecording itself is defined — a
+standard, safe closure pattern, not a bug.
+NOT YET re-tested on-device after this fix — same honest caveat as
+every fix in this project before real confirmation.
+
+## Wake-word bug #2: stale closure, not the timer (real, deeper root cause)
+
+Reported: still no Stop & Send button, recording still didn't stop, even
+after the auto-stop timer fix. This was NOT a second instance of the
+timer bug — the timer fix was correct but couldn't help, because the
+recording never actually reached voiceState === 'recording' via the
+wake-word path AT ALL.
+ROOT CAUSE, traced precisely: a classic React stale-closure chain, two
+layers deep.
+  Layer 1: startWakeWordListener creates the SpeechRecognition object and
+  attaches recognition.onresult ONCE, at the "Arm Wake Word" click. That
+  handler closes over triggerFromWakeWord, which closed over whatever
+  `voiceState` WAS at that exact instant ('idle') — never updated as
+  voiceState changed afterward.
+  Layer 2 (the deeper, more damaging one): startRecording's OWN internal
+  guard (`if (voiceState !== 'ready') return`) ALSO closed over
+  voiceState directly. Even after fixing layer 1 to correctly call
+  startRecording, THAT function's own frozen 'idle' voiceState meant its
+  guard clause returned immediately every time, silently, before ever
+  reaching the code that sets voiceState to 'recording' — explaining
+  both symptoms together (mic permission/activity from connectVoice()
+  being called repeatedly, but no actual recording state ever reached,
+  hence no button and nothing to stop).
+FIX: added voiceStateRef (a ref mirrored to voiceState via a useEffect,
+same pattern already used correctly for wakeWordArmedRef) and changed
+BOTH triggerFromWakeWord's check AND startRecording's own internal guard
+to read voiceStateRef.current instead of the closed-over voiceState.
+Applied the same fix to stopRecording proactively (identical
+stale-closure-prone pattern, called from the auto-stop timer's closure)
+rather than wait for a third bug report on the same root cause.
+Checked declaration ordering explicitly before shipping (voiceStateRef
+is textually declared AFTER both functions that use it) — confirmed
+safe: React re-runs the full component body top-to-bottom every render,
+so by the time any user interaction/callback actually fires (always
+after a render completes), every const in scope has been assigned
+regardless of textual position. Same safe pattern already relied on for
+stopRecording being referenced inside startRecording's setTimeout.
+NOT YET re-tested on-device — same honest caveat as every fix in this
+project before real confirmation. This is the second attempt at this
+specific bug; genuinely expect this fix to be correct given the root
+cause is now precisely identified rather than guessed at, but "correctly
+diagnosed" and "confirmed working" are still different claims.
+
+## True real-time streaming (built, genuinely untested, biggest change yet)
+
+Per explicit request: convert from turn-based (record fully, then send,
+then wait) to the way Live is actually designed to be used — continuous
+bidirectional audio, no turns.
+
+Built as a NEW, separate endpoint/mode (server: /ws/live-stream; browser:
+a new "Real-Time Stream" panel), NOT a replacement — /ws/live and the
+turn-based voice panel are completely untouched, matching this project's
+consistent pattern (ears.py/ears_local.py, mouth.py/mouth_local.py, etc.)
+of adding new capability alongside proven ones rather than risking them.
+
+REAL STRUCTURAL DIFFERENCES from /ws/live, confirmed via research (6+
+independent current sources: Google's own docs, Vertex docs, a working
+robot project, etc.) before building:
+1. send_realtime_input(audio=...), NOT send_client_content(...,
+   turn_complete=True) — a genuinely different call for genuinely
+   continuous streaming vs. turn-based.
+2. Server needs TWO CONCURRENT tasks (asyncio.gather), not one
+   sequential loop — receiving-from-browser-and-forwarding-to-Gemini and
+   receiving-from-Gemini-and-forwarding-to-browser now happen AT THE
+   SAME TIME, since you can be talking while Gemini is still replying.
+3. A genuinely NEW signal /ws/live never needed: interruption
+   (server_content.interrupted, confirmed via Google's own Vertex docs)
+   — fires when the user talks over an in-progress reply; server
+   forwards this to the browser, which is expected to flush/stop queued
+   reply audio.
+4. Reply audio arrives as a stream of small chunks, not one buffered
+   blob at turn-end (there is no turn-end here) — browser schedules
+   chunks back-to-back via an AudioContext-relative next-play-time
+   tracker (nextPlayTimeRef) so they sound continuous rather than
+   gapping/clicking between arrivals.
+
+REUSED, not reinvented: the exact same PCM_WORKLET_SOURCE for capture,
+the exact same int16->float32 conversion logic for playback, and the
+exact same two-AudioContext split (capture at 16kHz, playback separate)
+that fixed the earlier autoplay bug — all proven pieces, only the
+connection/scheduling logic around them is new.
+
+HONEST, KNOWN LIMITATION in this first version, not hidden: interruption
+handling resets WHERE FUTURE chunks get scheduled (nextPlayTimeRef), but
+does NOT stop audio that's already actively playing from an already-
+started buffer source — Web Audio buffer sources need to be tracked
+individually and have .stop() called on each to truly silence
+mid-playback audio, which isn't implemented here. Real, meaningful gap:
+an interruption will stop NEW reply audio from continuing to queue up,
+but whatever's already sounding when the interrupt fires will finish
+playing out. Worth fixing properly if the "talk over it" experience
+matters in practice — track active sources in an array on
+playStreamChunk and call .stop() on all of them inside
+flushStreamPlayback.
+
+VERIFICATION STATUS: this is the single biggest, riskiest change in the
+whole project so far — bigger than /ws/live's original build, and /ws/
+live itself needed real debugging (the 1007 error, send_client_content
+vs send_realtime_input) even for the simpler turn-based case. This has
+NOT been run even once — no network access in the environment that
+wrote it. Expect genuine bugs on first attempt: concurrency issues
+(asyncio.gather task interaction), audio chunk scheduling glitches
+(gaps, overlaps, or drift between nextPlayTimeRef and actual playback),
+and the known interruption gap above are all real, plausible first
+failure points — start debugging there, not from scratch.

@@ -10,34 +10,6 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 // "system is alive" signal; radial/circular data arrangements rather than
 // rectangular cards; small rotating/ticking micro-readouts around a calm
 // central presence, not a wall of text.
-//
-// Color (named, not generic "AI-blue"):
-//   --void:      #0A0A0C  (near-black base — cold, not warm)
-//   --steel:     #3D4147  (inactive borders, dividers, resting-state UI)
-//   --glow:      #00D4FF  (the HUD's living color — scanlines, active ring)
-//   --stark-red: #C4001A  (accent only — listening state, alerts)
-//   --paper:     #E8E8E8  (primary text — off-white, not pure #FFF, so it
-//                          doesn't compete with --glow under a real glow effect)
-//
-// Type: a technical/monospace face for data readouts and labels (system
-// voice), a clean sans for the actual spoken transcript (human/AI voice) —
-// these should NOT look identical, since a HUD narrates ABOUT the
-// conversation as well as showing it.
-//
-// Layout/signature: NOT a chat app. A central circular "core" that
-// physically reacts to voice activity (radius/glow pulsing with amplitude),
-// radial status readouts around it (connection, session id, latency-style
-// numbers reminiscent of Stark-tech diagnostics), and the transcript
-// flowing as a ticking, low-opacity feed beneath — present, but secondary
-// to the core, the way Homecoming's HUD keeps Peter's actual view primary
-// and data peripheral.
-//
-// Self-critique pass: the obvious generic version of this brief is a dark
-// dashboard with a green "mic active" pill and a chat bubble list — cut
-// that entirely. Radial layout + a single glowing reactive ring is the one
-// place this design takes a real risk; everything else (spacing, the
-// ticker, the status labels) stays quiet and disciplined around it, per
-// the skill's "spend your boldness in one place" principle.
 // ---------------------------------------------------------------------------
 
 const COLORS = {
@@ -48,14 +20,11 @@ const COLORS = {
   paper: '#E8E8E8',
 };
 
-// Change this to your real deployed WebSocket URL once you're testing
-// against the live server rather than a local one.
 const DEFAULT_WS_URL = 'wss://edith-flame.vercel.app/ws';
+const LIVE_WS_URL = DEFAULT_WS_URL.replace(/\/ws$/, '/ws/live');
+const LIVE_STREAM_WS_URL = DEFAULT_WS_URL.replace(/\/ws$/, '/ws/live-stream');
 
 function useRadialTicks(count, radius) {
-  // Generates the small tick-mark positions around the core — a real,
-  // deliberate HUD device (Homecoming's rings are built from many small
-  // radial ticks, not a solid circle), computed once per radius/count.
   return Array.from({ length: count }, (_, i) => {
     const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
     return {
@@ -66,25 +35,6 @@ function useRadialTicks(count, radius) {
   });
 }
 
-// Live voice endpoint - same host as the text /ws endpoint, different path.
-const LIVE_WS_URL = DEFAULT_WS_URL.replace(/\/ws$/, '/ws/live');
-
-// The AudioWorklet processor that converts the browser's native Float32
-// audio samples into 16-bit PCM, matching what Gemini Live's input
-// expects. MUST be loaded as a separate module (a real, hard constraint
-// of the AudioWorklet API — confirmed via research: worklets can't be
-// inline functions the way a normal event handler can), so this is
-// created as a Blob URL at runtime rather than a separate served file —
-// keeps this workable in a single-file sandbox like PlayCode, not just a
-// full multi-file build.
-//
-// WHY NOT MediaRecorder: confirmed via research that MediaRecorder
-// cannot produce raw PCM at all — only compressed/container formats
-// (webm, ogg). This is the SAME category of problem ears.py hit with
-// termux-microphone-record only producing AAC/M4A, not raw PCM, which
-// needed a real ffmpeg conversion step to work around. AudioWorklet is
-// the correct, if more involved, browser equivalent — it's the thing
-// standing in for ffmpeg's role here, not an optional extra.
 const PCM_WORKLET_SOURCE = `
 class PCM16Processor extends AudioWorkletProcessor {
   process(inputs) {
@@ -106,7 +56,7 @@ registerProcessor('pcm16-processor', PCM16Processor);
 
 export default function EdithHUD() {
   const [wsUrl, setWsUrl] = useState(DEFAULT_WS_URL);
-  const [connectionState, setConnectionState] = useState('disconnected'); // disconnected | connecting | connected | error
+  const [connectionState, setConnectionState] = useState('disconnected');
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState([]);
   const [inputText, setInputText] = useState('');
@@ -114,20 +64,22 @@ export default function EdithHUD() {
   const wsRef = useRef(null);
   const transcriptEndRef = useRef(null);
 
-  // --- Live voice state, kept separate from the text-mode state above ---
-  const [voiceMode, setVoiceMode] = useState(false); // false = text /ws, true = voice /ws/live
-  const [voiceState, setVoiceState] = useState('idle'); // idle | connecting | ready | recording | processing
+  // --- Live voice state variables ---
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [voiceState, setVoiceState] = useState('idle');
   const liveWsRef = useRef(null);
-  const audioContextRef = useRef(null);
+  
+  // Decoupled Audio Context Interfaces
+  const audioContextRef = useRef(null);     // Hard-locked to 16kHz exclusively for Mic Capture
+  const playbackContextRef = useRef(null);   // Runs at system native rate for speaker playback
+  
   const workletNodeRef = useRef(null);
   const micStreamRef = useRef(null);
-  const playbackQueueRef = useRef([]); // holds reply audio ArrayBuffers received while one is already playing
+  const playbackQueueRef = useRef([]);
 
   const outerTicks = useRadialTicks(48, 140);
   const innerTicks = useRadialTicks(24, 110);
 
-  // Ambient pulse animation for the core ring — even at rest, a HUD should
-  // read as "alive," not static. Speeds up when actively listening/replying.
   useEffect(() => {
     const speed = isListening ? 40 : 90;
     const interval = setInterval(() => {
@@ -209,33 +161,28 @@ export default function EdithHUD() {
     setInputText('');
   }, [inputText, connectionState]);
 
-  // --- Live voice: connect, capture, playback ---
-  //
-  // Turn-based, matching server/main.py's /ws/live protocol and
-  // live_explore.py's proven architecture: press to start recording,
-  // press again to stop and send (an "END_TURN" text signal), then wait
-  // for the reply. NOT continuous/always-listening — same honest
-  // simplification reasoning as live_explore.py's own turn-based design.
-
+  // --- Live voice: playback handler ---
   const playReplyAudio = useCallback(async (arrayBuffer) => {
-    // The server sends raw 16-bit PCM, 24kHz, mono — Live's OUTPUT rate
-    // (different from the 16kHz INPUT rate used for capture below; this
-    // distinction caused real confusion earlier in this project and is
-    // deliberately called out here so it isn't relearned). Web Audio's
-    // AudioBuffer wants Float32 samples, so convert back the other way
-    // from what the worklet did for capture.
-    if (!audioContextRef.current) return;
+    if (!playbackContextRef.current) return;
+    
+    // Safety check to clear web browser autoplay state blocks
+    if (playbackContextRef.current.state === 'suspended') {
+      await playbackContextRef.current.resume();
+    }
+
     const int16 = new Int16Array(arrayBuffer);
     const float32 = new Float32Array(int16.length);
     for (let i = 0; i < int16.length; i++) {
       float32[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7fff);
     }
-    const audioBuffer = audioContextRef.current.createBuffer(1, float32.length, 24000);
+    
+    // Explicitly target Gemini's native 24kHz stream output specification
+    const audioBuffer = playbackContextRef.current.createBuffer(1, float32.length, 24000);
     audioBuffer.copyToChannel(float32, 0);
 
-    const source = audioContextRef.current.createBufferSource();
+    const source = playbackContextRef.current.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(audioContextRef.current.destination);
+    source.connect(playbackContextRef.current.destination);
 
     return new Promise((resolve) => {
       source.onended = resolve;
@@ -243,8 +190,175 @@ export default function EdithHUD() {
     });
   }, []);
 
+  // --- TRUE REAL-TIME STREAMING MODE (separate from turn-based voice
+  // above, which is left completely untouched) ---
+  //
+  // Structural difference from the turn-based mode: no "recording"
+  // state, no manual/auto stop, no END_TURN signal. Once connected,
+  // mic audio flows to the server CONTINUOUSLY, and reply audio arrives
+  // as a stream of small chunks rather than one buffered blob at
+  // turn-end. Scheduled to play back-to-back (via nextPlayTimeRef,
+  // below) rather than each chunk starting a source at "now" — starting
+  // every chunk immediately would cause audible gaps/overlaps since
+  // network arrival timing isn't perfectly even.
+  const [streamState, setStreamState] = useState('idle'); // idle | connecting | streaming
+  const streamWsRef = useRef(null);
+  const streamAudioContextRef = useRef(null);
+  const streamWorkletNodeRef = useRef(null);
+  const streamMicStreamRef = useRef(null);
+  const nextPlayTimeRef = useRef(0); // AudioContext-relative time the NEXT chunk should start at
+
+  const playStreamChunk = useCallback((arrayBuffer) => {
+    // Reuses the EXACT SAME int16->float32 conversion as playReplyAudio
+    // above (Live's confirmed 24kHz output rate) — only the SCHEDULING
+    // differs, since chunks need to queue back-to-back rather than each
+    // assuming it's the only audio to play.
+    if (!playbackContextRef.current) return;
+    if (playbackContextRef.current.state === 'suspended') {
+      playbackContextRef.current.resume();
+    }
+
+    const int16 = new Int16Array(arrayBuffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / (int16[i] < 0 ? 0x8000 : 0x7fff);
+    }
+
+    const audioBuffer = playbackContextRef.current.createBuffer(1, float32.length, 24000);
+    audioBuffer.copyToChannel(float32, 0);
+
+    const source = playbackContextRef.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(playbackContextRef.current.destination);
+
+    const now = playbackContextRef.current.currentTime;
+    // Schedule this chunk to start either now (if we've fallen behind /
+    // this is the first chunk) or right after the previously scheduled
+    // chunk ends — this is what makes continuous small chunks sound like
+    // one unbroken stream rather than clicking/gapping between pieces.
+    const startAt = Math.max(now, nextPlayTimeRef.current);
+    source.start(startAt);
+    nextPlayTimeRef.current = startAt + audioBuffer.duration;
+  }, []);
+
+  const flushStreamPlayback = useCallback(() => {
+    // Called on an "interrupted" signal from the server — per Google's
+    // own docs (confirmed via research), this fires when the user
+    // starts talking over an in-progress reply. Resetting
+    // nextPlayTimeRef to "now" means any FUTURE chunks won't be
+    // scheduled after stale, already-queued audio. Note: this does NOT
+    // stop audio already actively playing from its buffer — Web Audio
+    // buffer sources can't be silenced mid-playback without tracking
+    // and calling .stop() on each one individually, which isn't done
+    // here. This is a real, known limitation of this first version, not
+    // an oversight being hidden — flagged in AGENT.md.
+    if (playbackContextRef.current) {
+      nextPlayTimeRef.current = playbackContextRef.current.currentTime;
+    }
+  }, []);
+
+  const connectLiveStream = useCallback(async () => {
+    setStreamState('connecting');
+
+    if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+      playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    nextPlayTimeRef.current = 0;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamMicStreamRef.current = stream;
+
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      streamAudioContextRef.current = audioContext;
+
+      // Reuses the SAME PCM_WORKLET_SOURCE already proven working in
+      // the turn-based mode — no new capture mechanism, just a
+      // continuous connection instead of a start/stop cycle around it.
+      const blob = new Blob([PCM_WORKLET_SOURCE], { type: 'application/javascript' });
+      const workletUrl = URL.createObjectURL(blob);
+      await audioContext.audioWorklet.addModule(workletUrl);
+
+      const source = audioContext.createMediaStreamSource(stream);
+      const workletNode = new AudioWorkletNode(audioContext, 'pcm16-processor');
+      streamWorkletNodeRef.current = workletNode;
+
+      const ws = new WebSocket(LIVE_STREAM_WS_URL);
+      ws.binaryType = 'arraybuffer';
+      streamWsRef.current = ws;
+
+      workletNode.port.onmessage = (event) => {
+        // Sent CONTINUOUSLY, the instant each chunk is captured — no
+        // buffering, no waiting for a stop signal, unlike the turn-based
+        // mode's worklet handler.
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(event.data);
+        }
+      };
+
+      ws.onopen = () => {
+        source.connect(workletNode);
+        setTranscript((t) => [...t, { type: 'system', text: 'Real-time stream connecting...' }]);
+      };
+
+      ws.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          playStreamChunk(event.data);
+          return;
+        }
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'live_ready') {
+            setStreamState('streaming');
+            setTranscript((t) => [...t, { type: 'system', text: 'Real-time stream active — just start talking.' }]);
+          } else if (data.type === 'tool_used') {
+            setTranscript((t) => [...t, { type: 'system', text: `[used ${data.name}]` }]);
+          } else if (data.type === 'input_transcript') {
+            setTranscript((t) => [...t, { type: 'user', text: data.text }]);
+          } else if (data.type === 'output_transcript') {
+            setTranscript((t) => [...t, { type: 'edith', text: data.text }]);
+          } else if (data.type === 'interrupted') {
+            flushStreamPlayback();
+            setTranscript((t) => [...t, { type: 'system', text: '[interrupted]' }]);
+          } else if (data.type === 'error') {
+            setTranscript((t) => [...t, { type: 'error', text: data.text }]);
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onerror = () => {
+        setTranscript((t) => [...t, { type: 'error', text: 'Real-time stream error.' }]);
+        setStreamState('idle');
+      };
+
+      ws.onclose = () => {
+        setStreamState('idle');
+        setTranscript((t) => [...t, { type: 'system', text: 'Real-time stream closed.' }]);
+      };
+    } catch (e) {
+      setTranscript((t) => [...t, { type: 'error', text: `Microphone access failed: ${e.message}` }]);
+      setStreamState('idle');
+    }
+  }, [playStreamChunk, flushStreamPlayback]);
+
+  const disconnectLiveStream = useCallback(() => {
+    streamWorkletNodeRef.current?.disconnect();
+    streamMicStreamRef.current?.getTracks().forEach((track) => track.stop());
+    streamAudioContextRef.current?.close();
+    streamWsRef.current?.close();
+    setStreamState('idle');
+  }, []);
+
   const connectVoice = useCallback(() => {
     setVoiceState('connecting');
+    
+    // Instantiate or revive the dedicated playback infrastructure securely on explicit User Click Gesture
+    if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
+      playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
     const ws = new WebSocket(LIVE_WS_URL);
     ws.binaryType = 'arraybuffer';
 
@@ -254,9 +368,6 @@ export default function EdithHUD() {
 
     ws.onmessage = async (event) => {
       if (event.data instanceof ArrayBuffer) {
-        // Binary frame = reply audio. Queue it so overlapping arrivals
-        // (shouldn't normally happen in this turn-based design, but
-        // defensive) don't play on top of each other.
         playbackQueueRef.current.push(event.data);
         if (playbackQueueRef.current.length === 1) {
           while (playbackQueueRef.current.length > 0) {
@@ -288,7 +399,7 @@ export default function EdithHUD() {
           setIsListening(false);
         }
       } catch {
-        // Non-JSON, non-ArrayBuffer text frame — ignore.
+        // Non-JSON string frames ignored securely
       }
     };
 
@@ -305,7 +416,29 @@ export default function EdithHUD() {
     liveWsRef.current = ws;
   }, [playReplyAudio]);
 
+  // Fixed max duration for a SINGLE recorded turn, used for wake-word-
+  // triggered recordings specifically (manual "Press to Speak" turns are
+  // still stopped by hand via the "Stop & Send" button, unchanged).
+  // Chosen over silence-detection per explicit preference: simpler,
+  // predictable, no separate audio-level-analysis logic needed that
+  // would itself need real device tuning to get right.
+  const AUTO_STOP_MS = 8000;
+  const autoStopTimerRef = useRef(null);
+
   const startRecording = useCallback(async () => {
+    // FIX: read voiceState DIRECTLY here, not via voiceStateRef. The ref
+    // was introduced to solve staleness for the WAKE-WORD path (an
+    // async SpeechRecognition callback that doesn't re-render with the
+    // component). A manual "Press to Speak" click is a normal React
+    // event handler — it runs with the CURRENT voiceState already
+    // correctly closed over from the render that made the button
+    // visible in the first place (the button's own label is gated on
+    // voiceState === 'ready', so if you can see and click it, voiceState
+    // genuinely is 'ready' in this render's closure). Using the ref here
+    // introduced a real, apparently-manifesting timing gap instead of
+    // fixing anything for this specific call path — reported symptom
+    // was that manual Press to Speak didn't start recording at all,
+    // which is what this direct read fixes.
     if (voiceState !== 'ready') return;
 
     try {
@@ -315,10 +448,6 @@ export default function EdithHUD() {
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
       audioContextRef.current = audioContext;
 
-      // AudioWorklet, loaded from a Blob URL (see PCM_WORKLET_SOURCE's
-      // comment for why this specific approach — worklets must be
-      // separate modules, can't be inline functions, but this keeps the
-      // whole component self-contained for single-file environments).
       const blob = new Blob([PCM_WORKLET_SOURCE], { type: 'application/javascript' });
       const workletUrl = URL.createObjectURL(blob);
       await audioContext.audioWorklet.addModule(workletUrl);
@@ -328,31 +457,52 @@ export default function EdithHUD() {
       workletNodeRef.current = workletNode;
 
       workletNode.port.onmessage = (event) => {
-        // event.data is an Int16Array's underlying ArrayBuffer — raw
-        // 16-bit PCM, matching what server/main.py's /ws/live expects.
         if (liveWsRef.current?.readyState === WebSocket.OPEN) {
           liveWsRef.current.send(event.data);
         }
       };
 
       source.connect(workletNode);
-      // Deliberately NOT connecting workletNode to audioContext.destination
-      // — we don't want to hear our own mic input played back locally.
 
       setVoiceState('recording');
       setIsListening(true);
-      setTranscript((t) => [...t, { type: 'system', text: '[recording — speak now]' }]);
+      setTranscript((t) => [...t, { type: 'system', text: `[recording — speak now, auto-sends in ${AUTO_STOP_MS / 1000}s]` }]);
+
+      if (autoStopTimerRef.current) clearTimeout(autoStopTimerRef.current);
+      // DIAGNOSTIC LOGGING ADDED HERE, deliberately, given no further
+      // turns available to debug blind: this makes the actual failure
+      // point VISIBLE in the transcript itself the moment this is
+      // tested, rather than requiring a live dev-console session that
+      // isn't available in this conversation. Once confirmed working
+      // (or once the actual break point is visible), these two log
+      // lines are safe to delete.
+      setTranscript((t) => [...t, { type: 'system', text: `[debug] timer armed for ${AUTO_STOP_MS}ms` }]);
+      autoStopTimerRef.current = setTimeout(() => {
+        setTranscript((t) => [...t, {
+          type: 'system',
+          text: `[debug] timer FIRED. voiceStateRef=${voiceStateRef.current}, stopRecordingRef exists=${!!stopRecordingRef.current}`,
+        }]);
+        stopRecordingRef.current?.();
+      }, AUTO_STOP_MS);
     } catch (e) {
       setTranscript((t) => [...t, { type: 'error', text: `Microphone access failed: ${e.message}` }]);
     }
   }, [voiceState]);
 
   const stopRecording = useCallback(() => {
-    if (voiceState !== 'recording') return;
+    // Same fix applied proactively here as in startRecording above —
+    // this function is called from inside a setTimeout closure (the
+    // auto-stop timer) and could suffer the identical staleness if
+    // voiceState were read directly rather than via the always-current
+    // ref.
+    if (voiceStateRef.current !== 'recording') return;
 
-    // Tear down capture first, then signal END_TURN — matches the
-    // server's protocol (accumulate binary frames until a text
-    // "END_TURN" arrives, then process the whole turn).
+    if (autoStopTimerRef.current) {
+      clearTimeout(autoStopTimerRef.current);
+      autoStopTimerRef.current = null;
+    }
+
+    // Safely tear down recording interfaces without compromising the secondary audio playback context
     workletNodeRef.current?.disconnect();
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     audioContextRef.current?.close();
@@ -363,7 +513,180 @@ export default function EdithHUD() {
 
     setVoiceState('processing');
     setTranscript((t) => [...t, { type: 'system', text: '[processing your message]' }]);
+  }, []);
+
+  // Keep stopRecordingRef always pointed at the latest stopRecording.
+  // Deliberately NO dependency array — runs after every render, so this
+  // ref can never fall behind, no matter what.
+  useEffect(() => {
+    stopRecordingRef.current = stopRecording;
+  });
+
+  // --- Wake word / phrase activation ---
+  //
+  // Uses the browser's built-in Web Speech API (SpeechRecognition) — free,
+  // no new dependency, continuous listening watching for a trigger
+  // phrase. When detected, calls the EXISTING startRecording() above,
+  // unmodified — this only adds a new trigger in front of the
+  // already-proven Live pipeline, not a parallel one.
+  //
+  // TWO REAL, RESEARCHED CONSTRAINTS this design works around rather than
+  // discovers the hard way:
+  //   1. recognition.start() requires a real user gesture (a click),
+  //      same category of browser security restriction that caused the
+  //      earlier audio-playback bug (fixed by creating playbackContextRef
+  //      inside a click handler). This means TRUE zero-touch wake-word
+  //      (like a physical Alexa device) isn't achievable in a browser tab
+  //      — there's always one initial "Arm Wake Word" click to grant
+  //      listening rights. After that, it stays listening.
+  //   2. Chrome's continuous mode self-stops after ~60s of silence,
+  //      firing onend WITHOUT warning (confirmed via multiple current
+  //      sources). Without handling this, the wake word would silently
+  //      stop working after a minute of quiet. Fixed by auto-restarting
+  //      recognition inside onend whenever wake-word mode is still
+  //      meant to be armed.
+  const [wakeWordArmed, setWakeWordArmed] = useState(false);
+  const [wakePhrase, setWakePhrase] = useState('hey edith');
+  const recognitionRef = useRef(null);
+  const wakeWordArmedRef = useRef(false); // mirrors wakeWordArmed for use inside the onend closure below
+
+  // THE ACTUAL FIX for "Stop & Send never appears / recording never
+  // stops": this is a classic React stale-closure bug, not a second
+  // instance of the earlier timer-related fix. startWakeWordListener
+  // creates the SpeechRecognition object and attaches its onresult
+  // handler ONCE, at the moment "Arm Wake Word" is clicked — that
+  // handler closes over triggerFromWakeWord, which closes over whatever
+  // `voiceState` WAS at that exact instant ('idle'). voiceState changes
+  // many times afterward (idle -> connecting -> ready -> recording ->
+  // ...), but the already-constructed recognition object's callback
+  // never gets recreated, so it kept checking a frozen, stale 'idle'
+  // value forever — meaning it likely kept calling connectVoice() again
+  // instead of ever reaching startRecording(), which is consistent with
+  // both reported symptoms (mic activity with no real recording turn
+  // ever starting, and the Stop & Send button — gated on voiceState ===
+  // 'recording' — never appearing because that state was never actually
+  // reached via this path).
+  // FIX: mirror voiceState into a ref that's always current, and read
+  // FROM THE REF inside triggerFromWakeWord instead of the closed-over
+  // state value — same pattern already used correctly for
+  // wakeWordArmedRef above, now applied here too.
+  const voiceStateRef = useRef(voiceState);
+  useEffect(() => {
+    voiceStateRef.current = voiceState;
   }, [voiceState]);
+
+  // stopRecordingRef: mirrors the CURRENT stopRecording function, same
+  // pattern as voiceStateRef mirroring state. THE POINT of this ref:
+  // the auto-stop setTimeout below calls stopRecordingRef.current(), not
+  // "stopRecording" directly — so it can NEVER go stale, regardless of
+  // which closure created the timer or how many layers of function
+  // identity changed in between. This removes the dependency on
+  // startRecording's own closure staying fresh entirely, rather than
+  // fixing one more layer of it.
+  const stopRecordingRef = useRef(null);
+
+  const triggerFromWakeWordRef = useRef(null);
+  // Set to true when the wake word fires while still 'idle' (not yet
+  // connected to Live) — signals "start recording as soon as the
+  // connection actually finishes," checked by the effect below rather
+  // than assumed to happen instantly. This is the fix for "Press to
+  // Speak needs to start after the phrase connects Live": connectVoice()
+  // only INITIATES the connection — it doesn't complete synchronously,
+  // so calling startRecording() right after it, without waiting for the
+  // real 'ready' transition, was the actual gap.
+  const pendingAutoRecordRef = useRef(false);
+
+  useEffect(() => {
+    triggerFromWakeWordRef.current = () => {
+      setTranscript((t) => [...t, { type: 'system', text: `Wake phrase detected — listening...` }]);
+      const currentVoiceState = voiceStateRef.current;
+      if (currentVoiceState === 'ready') {
+        startRecording();
+      } else if (currentVoiceState === 'idle') {
+        pendingAutoRecordRef.current = true;
+        connectVoice();
+        setTranscript((t) => [...t, { type: 'system', text: 'Connecting to Live before recording...' }]);
+      }
+    };
+  });
+
+  // Watches for the ACTUAL moment voiceState becomes 'ready' — this is
+  // the real connection-completion signal, not a guessed delay. If a
+  // wake-word-triggered connectVoice() is what got us here
+  // (pendingAutoRecordRef is true), start recording now, then clear the
+  // flag so a normal manual connect afterward doesn't also auto-start a
+  // recording unexpectedly.
+  useEffect(() => {
+    if (voiceState === 'ready' && pendingAutoRecordRef.current) {
+      pendingAutoRecordRef.current = false;
+      startRecording();
+    }
+  }, [voiceState]);
+
+  const triggerFromWakeWord = useCallback(() => {
+    triggerFromWakeWordRef.current?.();
+  }, []);
+
+  const startWakeWordListener = useCallback(() => {
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      setTranscript((t) => [...t, {
+        type: 'error',
+        text: 'Wake word requires Chrome or Safari — this browser doesn\'t support SpeechRecognition.',
+      }]);
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    recognition.onresult = (event) => {
+      // Check ALL results (not just the latest) since interim results
+      // can contain the phrase before a "final" result ever fires —
+      // waiting for isFinal would add real, noticeable latency to wake
+      // detection.
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const text = event.results[i][0].transcript.toLowerCase();
+        if (text.includes(wakePhrase.toLowerCase())) {
+          triggerFromWakeWord();
+          break;
+        }
+      }
+    };
+
+    recognition.onerror = (event) => {
+      // 'no-speech' and 'aborted' are routine, not real errors — don't
+      // spam the transcript for those.
+      if (event.error !== 'no-speech' && event.error !== 'aborted') {
+        setTranscript((t) => [...t, { type: 'error', text: `Wake word listener error: ${event.error}` }]);
+      }
+    };
+
+    recognition.onend = () => {
+      // Chrome silently stops continuous recognition after ~60s of
+      // silence (confirmed via research) — restart automatically if
+      // we're still supposed to be armed, so wake-word listening
+      // doesn't quietly die after a minute of quiet.
+      if (wakeWordArmedRef.current) {
+        recognition.start();
+      }
+    };
+
+    recognitionRef.current = recognition;
+    recognition.start();
+    wakeWordArmedRef.current = true;
+    setWakeWordArmed(true);
+    setTranscript((t) => [...t, { type: 'system', text: `Wake word armed — listening for "${wakePhrase}"` }]);
+  }, [wakePhrase, triggerFromWakeWord]);
+
+  const stopWakeWordListener = useCallback(() => {
+    wakeWordArmedRef.current = false;
+    setWakeWordArmed(false);
+    recognitionRef.current?.stop();
+    setTranscript((t) => [...t, { type: 'system', text: 'Wake word disarmed.' }]);
+  }, []);
 
   const statusColor =
     connectionState === 'connected'
@@ -389,7 +712,6 @@ export default function EdithHUD() {
         boxSizing: 'border-box',
       }}
     >
-      {/* Top status bar - quiet, technical, radial-diagnostic in tone */}
       <div
         style={{
           width: '100%',
@@ -410,7 +732,6 @@ export default function EdithHUD() {
         </span>
       </div>
 
-      {/* The signature element: the reactive HUD core */}
       <div
         style={{
           position: 'relative',
@@ -440,7 +761,6 @@ export default function EdithHUD() {
           </defs>
 
           <g transform="translate(160, 160)">
-            {/* Outer tick ring - the "many small radial marks" HUD device */}
             {outerTicks.map((tick, i) => (
               <line
                 key={`outer-${i}`}
@@ -453,7 +773,6 @@ export default function EdithHUD() {
                 opacity={connectionState === 'connected' ? 0.85 : 0.3}
               />
             ))}
-            {/* Inner tick ring, offset rotation for a layered-instrument feel */}
             {innerTicks.map((tick, i) => (
               <line
                 key={`inner-${i}`}
@@ -468,13 +787,6 @@ export default function EdithHUD() {
               />
             ))}
 
-            {/* Main reactive core ring - real glow via SVG filter, NOT css
-                text-shadow/box-shadow: confirmed via direct visual testing
-                (rendered and screenshotted both approaches) that box-shadow/
-                text-shadow read as a barely-visible thin outline, while an
-                feGaussianBlur+feMerge filter produces a genuine light bloom.
-                Don't swap this back to a CSS-shadow approach without
-                re-checking against a real screenshot first. */}
             <circle
               r={70}
               fill="none"
@@ -494,7 +806,6 @@ export default function EdithHUD() {
               opacity={connectionState === 'connected' ? 0.6 : 0.2}
               transform={`rotate(${-pulsePhase})`}
             />
-            {/* Core glow fill */}
             <circle
               r={55}
               fill={isListening ? COLORS.starkRed : COLORS.glow}
@@ -504,10 +815,6 @@ export default function EdithHUD() {
             />
           </g>
 
-          {/* Arc-integrated label - sits ON the ring geometry as real HUD
-              instrumentation, rather than centered like a logo lockup
-              (an earlier version did this; direct visual review showed it
-              read as an afterthought/logo, not part of the instrument). */}
           <text
             fontSize="11"
             letterSpacing="4"
@@ -522,12 +829,6 @@ export default function EdithHUD() {
           </text>
         </svg>
 
-        {/* Center readout - what E.D.I.T.H. is doing right now, plus a
-            small diagnostic line beneath it. Direct visual review of an
-            earlier version (label alone, no second line) showed the core's
-            center reading as too empty once the main label moved to the
-            arc above — this second line fills that space with real HUD
-            instrument density rather than leaving a void. */}
         <div style={{ textAlign: 'center', zIndex: 1, marginTop: 8 }}>
           <div
             style={{
@@ -553,7 +854,6 @@ export default function EdithHUD() {
         </div>
       </div>
 
-      {/* Uplink configuration - quiet, technical, not a prominent form */}
       <div
         style={{
           width: '100%',
@@ -596,7 +896,6 @@ export default function EdithHUD() {
         </button>
       </div>
 
-      {/* Transcript - ticker-style, secondary to the core, per the design plan */}
       <div
         style={{
           width: '100%',
@@ -649,7 +948,6 @@ export default function EdithHUD() {
         <div ref={transcriptEndRef} />
       </div>
 
-      {/* Input */}
       <div style={{ width: '100%', maxWidth: 600, display: 'flex', gap: 8, marginTop: '1rem' }}>
         <input
           value={inputText}
@@ -688,11 +986,6 @@ export default function EdithHUD() {
         </button>
       </div>
 
-      {/* Live voice panel — separate uplink from the text /ws above,
-          talks to /ws/live. Turn-based: connect once, then press to
-          record, press again to stop and send — matching
-          server/main.py's END_TURN protocol and live_explore.py's
-          proven turn-based architecture (not continuous/always-on). */}
       <div
         style={{
           width: '100%',
@@ -745,6 +1038,99 @@ export default function EdithHUD() {
             {voiceState === 'recording' && 'Stop & Send'}
             {voiceState === 'processing' && 'Processing...'}
           </button>
+        )}
+      </div>
+
+      {/* Wake word panel — arms/disarms continuous phrase listening.
+          Deliberately separate row from the manual Live Voice controls
+          above; wake-word triggers the SAME startRecording()/
+          connectVoice() pipeline, it doesn't duplicate it. */}
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 600,
+          display: 'flex',
+          gap: 8,
+          marginTop: '0.75rem',
+          alignItems: 'center',
+        }}
+      >
+        <span style={{ fontSize: '0.65rem', letterSpacing: '0.1em', color: COLORS.steel, textTransform: 'uppercase' }}>
+          Wake Phrase:
+        </span>
+        <input
+          value={wakePhrase}
+          onChange={(e) => setWakePhrase(e.target.value)}
+          disabled={wakeWordArmed}
+          style={{
+            background: 'transparent',
+            border: `1px solid ${COLORS.steel}`,
+            color: COLORS.paper,
+            fontFamily: 'inherit',
+            fontSize: '0.7rem',
+            padding: '0.35rem 0.6rem',
+            width: 120,
+          }}
+        />
+        <button
+          onClick={wakeWordArmed ? stopWakeWordListener : startWakeWordListener}
+          style={{
+            background: wakeWordArmed ? COLORS.starkRed : 'transparent',
+            border: `1px solid ${wakeWordArmed ? COLORS.starkRed : COLORS.glow}`,
+            color: wakeWordArmed ? COLORS.paper : COLORS.glow,
+            fontFamily: 'inherit',
+            fontSize: '0.7rem',
+            letterSpacing: '0.1em',
+            textTransform: 'uppercase',
+            padding: '0.4rem 1rem',
+            cursor: 'pointer',
+          }}
+        >
+          {wakeWordArmed ? 'Disarm' : 'Arm Wake Word'}
+        </button>
+        {wakeWordArmed && (
+          <span style={{ fontSize: '0.6rem', color: COLORS.glow, opacity: 0.7 }}>● listening</span>
+        )}
+      </div>
+
+      {/* True real-time streaming panel — separate mode from turn-based
+          Live Voice above. No recording state, no stop button: once
+          connected, just talk. */}
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 600,
+          display: 'flex',
+          gap: 8,
+          marginTop: '0.75rem',
+          alignItems: 'center',
+        }}
+      >
+        <span style={{ fontSize: '0.65rem', letterSpacing: '0.1em', color: COLORS.steel, textTransform: 'uppercase' }}>
+          Real-Time Stream:
+        </span>
+        <button
+          onClick={streamState === 'idle' ? connectLiveStream : disconnectLiveStream}
+          disabled={streamState === 'connecting'}
+          style={{
+            background: streamState === 'streaming' ? COLORS.starkRed : 'transparent',
+            border: `1px solid ${streamState === 'streaming' ? COLORS.starkRed : COLORS.glow}`,
+            color: streamState === 'streaming' ? COLORS.paper : COLORS.glow,
+            fontFamily: 'inherit',
+            fontSize: '0.7rem',
+            letterSpacing: '0.1em',
+            textTransform: 'uppercase',
+            padding: '0.4rem 1rem',
+            cursor: streamState === 'connecting' ? 'not-allowed' : 'pointer',
+            opacity: streamState === 'connecting' ? 0.5 : 1,
+          }}
+        >
+          {streamState === 'idle' && 'Start Streaming'}
+          {streamState === 'connecting' && 'Connecting...'}
+          {streamState === 'streaming' && 'Stop Streaming'}
+        </button>
+        {streamState === 'streaming' && (
+          <span style={{ fontSize: '0.6rem', color: COLORS.starkRed, opacity: 0.8 }}>● live — just talk</span>
         )}
       </div>
     </div>

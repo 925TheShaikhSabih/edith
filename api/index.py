@@ -378,5 +378,183 @@ async def websocket_live_endpoint(websocket: WebSocket):
         except Exception:
             pass  # connection may already be gone
 
+@app.websocket("/ws/live-stream")
+async def websocket_live_stream_endpoint(websocket: WebSocket):
+    """
+    TRUE real-time streaming voice, via Gemini Live — the way Live is
+    actually meant to be used, per explicit request after /ws/live's
+    turn-based approach (record fully, then send) worked correctly.
+
+    THE STRUCTURAL DIFFERENCE FROM /ws/live, stated plainly: /ws/live has
+    ONE sequential loop — accumulate audio until END_TURN, THEN send,
+    THEN wait for the full reply. This endpoint has NO such sequence.
+    Audio flows to Gemini continuously the instant it's captured, via
+    send_realtime_input (NOT send_client_content/turn_complete — a
+    different, genuinely continuous-streaming-oriented call, confirmed
+    via Google's own current docs and multiple independent working
+    examples, e.g. a Reachy Mini robot project's identical pattern).
+    Because sending and receiving now need to happen AT THE SAME TIME
+    (you can be still talking while Gemini has already started replying,
+    or interrupting it), this uses asyncio.gather to run two tasks
+    concurrently, not one bigger sequential loop:
+      - _forward_browser_to_gemini: browser binary frames -> Gemini,
+        continuously, no buffering, no turn concept.
+      - _forward_gemini_to_browser: Gemini's responses -> browser,
+        including a NEW signal /ws/live never needed: interruption.
+        Confirmed via Google's own Vertex docs: server_content.interrupted
+        fires when the user starts talking over an in-progress reply —
+        the client is expected to immediately flush/stop whatever
+        reply audio it was playing. Without forwarding this signal,
+        real-time voice would still be TECHNICALLY continuous but would
+        keep talking over you, defeating the actual point.
+
+    /ws/live is left completely untouched — this is a genuinely separate
+    endpoint/mode, not a replacement, matching the pattern of every other
+    addition in this project (ears.py/ears_local.py, mouth.py/
+    mouth_local.py, etc.) so the proven turn-based fallback stays intact.
+
+    Protocol on /ws/live-stream:
+      Client -> Server: BINARY frames = raw 16-bit PCM, 16kHz mono,
+                         sent continuously, no END_TURN signal at all —
+                         there is no "turn" on this endpoint.
+      Server -> Client: JSON control messages ({"type": "tool_used",...},
+                         {"type": "input_transcript",...},
+                         {"type": "output_transcript",...},
+                         {"type": "interrupted"} <- NEW, not present on
+                         /ws/live, tells the browser to immediately stop
+                         playing whatever reply audio is queued)
+                         interleaved with BINARY frames = raw 16-bit PCM,
+                         24kHz mono, sent as SMALL chunks as they arrive
+                         from Gemini (NOT buffered into one big frame at
+                         turn-end the way /ws/live does — there is no
+                         turn-end here to buffer until).
+
+    VERIFICATION STATUS: genuinely untested — no network access in the
+    environment that wrote this. This is a bigger, riskier change than
+    /ws/live was: two concurrent tasks instead of one sequential loop,
+    a new interruption-handling path that /ws/live never needed, and a
+    fundamentally different client-side audio strategy (continuous
+    small-chunk playback instead of one buffered reply). Expect this to
+    need real debugging on first attempt, likely more than one round,
+    the same as nearly every other new capability in this project.
+    """
+    await websocket.accept()
+    session_id = str(uuid.uuid4())[:8]
+    print(f"[live-stream session {session_id}] connected")
+
+    try:
+        client = genai.Client()
+    except Exception as e:
+        await websocket.send_json({"type": "error", "text": f"Couldn't start Live client: {e}"})
+        await websocket.close()
+        return
+
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=LIVE_SYSTEM_INSTRUCTION,
+        tools=live_tools,
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
+            )
+        ),
+    )
+
+    async def _forward_browser_to_gemini(session):
+        """Continuously reads binary audio frames from the browser and
+        forwards each one to Gemini immediately via send_realtime_input —
+        no accumulation, no turn boundary. Returns when the browser
+        disconnects."""
+        while True:
+            message = await websocket.receive()
+            if message.get("bytes") is not None:
+                await session.send_realtime_input(
+                    audio=types.Blob(data=message["bytes"], mime_type="audio/pcm;rate=16000")
+                )
+            # Unlike /ws/live, there's no text "END_TURN" to watch for —
+            # this endpoint has no turn concept at all. Any stray text
+            # frames are ignored here.
+
+    async def _forward_gemini_to_browser(session):
+        """Continuously reads Gemini's responses (tool calls, transcripts,
+        reply audio chunks, and interruption signals) and forwards each
+        to the browser AS IT ARRIVES — no buffering until a turn ends,
+        because there is no turn end on this endpoint."""
+        async for response in session.receive():
+            if response.tool_call:
+                function_responses = []
+                for fc in response.tool_call.function_calls:
+                    await websocket.send_json({"type": "tool_used", "name": fc.name})
+                    tool_fn = live_tool_registry.get(fc.name)
+                    kwargs = getattr(fc, "args", getattr(fc, "arguments", {})) or {}
+                    if tool_fn is None:
+                        result = {"ok": False, "error": f"no tool named {fc.name!r}"}
+                    else:
+                        try:
+                            result = tool_fn(**kwargs)
+                        except Exception as e:
+                            result = {"ok": False, "error": str(e)}
+                    function_responses.append(
+                        types.FunctionResponse(name=fc.name, id=fc.id, response={"result": result})
+                    )
+                await session.send_tool_response(function_responses=function_responses)
+
+            content = response.server_content
+            if not content:
+                continue
+
+            # NEW vs. /ws/live: real-time streaming means the user can
+            # start talking again while Gemini is still replying.
+            # Confirmed via Google's own Vertex docs: this is the signal
+            # to tell the browser to immediately stop/flush whatever
+            # reply audio it has queued, rather than keep talking over
+            # the user. /ws/live never needed this since it always
+            # waited for one full reply before allowing the next turn.
+            if content.interrupted:
+                await websocket.send_json({"type": "interrupted"})
+                continue
+
+            if content.input_transcription and content.input_transcription.text:
+                await websocket.send_json({
+                    "type": "input_transcript",
+                    "text": content.input_transcription.text,
+                })
+            if content.output_transcription and content.output_transcription.text:
+                await websocket.send_json({
+                    "type": "output_transcript",
+                    "text": content.output_transcription.text,
+                })
+            if content.model_turn:
+                for part in content.model_turn.parts:
+                    if part.inline_data:
+                        # Sent AS A SMALL CHUNK immediately, NOT buffered
+                        # until some turn-end signal — there is no
+                        # turn-end concept here, so buffering would just
+                        # mean waiting arbitrarily and defeating the
+                        # entire point of streaming.
+                        await websocket.send_bytes(part.inline_data.data)
+
+    try:
+        async with client.aio.live.connect(model=LIVE_MODEL_NAME, config=config) as session:
+            await websocket.send_json({"type": "live_ready"})
+            # Run both directions CONCURRENTLY — this is the actual
+            # structural change from /ws/live's one sequential loop.
+            # asyncio.gather with return_exceptions=False (default) means
+            # if EITHER task raises (e.g. the browser disconnects, which
+            # surfaces as a WebSocketDisconnect from the receive() call
+            # inside _forward_browser_to_gemini), the whole gather stops.
+            await asyncio.gather(
+                _forward_browser_to_gemini(session),
+                _forward_gemini_to_browser(session),
+            )
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"type": "error", "text": f"Live stream session error: {e}"})
+        except Exception:
+            pass
     finally:
-        print(f"[live session {session_id}] disconnected")
+        print(f"[live-stream session {session_id}] disconnected")
