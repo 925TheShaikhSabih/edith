@@ -331,8 +331,6 @@ export default function EdithHUD() {
           }, SILENCE_MS_TO_END_UTTERANCE);
         }
       };
-      const levelCheckInterval = setInterval(checkAudioLevel, 100);
-      streamLevelCheckIntervalRef.current = levelCheckInterval;
 
       const ws = new WebSocket(LIVE_STREAM_WS_URL);
       ws.binaryType = 'arraybuffer';
@@ -349,6 +347,21 @@ export default function EdithHUD() {
 
       ws.onopen = () => {
         source.connect(workletNode);
+        // THE ACTUAL FIX: the silence-detection interval is started
+        // HERE, only after the WebSocket has genuinely finished
+        // connecting — NOT immediately when connectLiveStream runs (the
+        // real bug in the previous version). Previously, checkAudioLevel
+        // could detect speech and set isSpeaking=true internally BEFORE
+        // streamWsRef.current existed or was OPEN — the `readyState ===
+        // OPEN` guard silently skipped sending UTTERANCE_START in that
+        // window rather than erroring, so speech during the brief
+        // connection delay (which very plausibly includes a user's
+        // FIRST utterance, spoken right after clicking connect) was
+        // detected locally but never actually communicated to the
+        // server at all. Starting the interval only once the socket is
+        // confirmed open closes this gap entirely.
+        const levelCheckInterval = setInterval(checkAudioLevel, 100);
+        streamLevelCheckIntervalRef.current = levelCheckInterval;
         setTranscript((t) => [...t, { type: 'system', text: 'Real-time stream connecting...' }]);
       };
 

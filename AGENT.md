@@ -1480,3 +1480,36 @@ source found for this specific mechanic in this whole project) — high
 confidence, but genuinely not yet re-tested on-device. Given this is
 now the SECOND attempted fix for the same reported symptom, treat this
 as likely-correct-but-unconfirmed, not certain, until tested for real.
+
+## Real-time streaming bug: initial command not detected (real ordering bug, browser-side)
+
+Reported: after the session.receive() while-loop fix, the VERY FIRST
+command stopped being detected at all (a different symptom than "nothing
+after the first reply" — this pointed at something new, not a leftover
+of the earlier bug).
+TRACED: a genuine ordering bug in connectLiveStream. The silence-
+detection interval (checkAudioLevel, running every 100ms) was started
+IMMEDIATELY when connectLiveStream ran — BEFORE the WebSocket object
+even existed (it's created a few lines later) and well before it
+finished its connection handshake (ws.onopen fires asynchronously,
+later). The guard `streamWsRef.current?.readyState === WebSocket.OPEN`
+correctly prevented a crash from sending on a not-yet-ready socket, but
+it silently SKIPPED sending UTTERANCE_START during that entire window —
+meanwhile isSpeaking was still set to true internally. Net effect: if a
+user spoke during the (very plausible, especially for a "first command
+right after clicking connect" pattern) brief window before the socket
+opened, that speech was detected locally by the analyser but the signal
+telling the SERVER "an utterance started" was never actually sent —
+explaining precisely "doesn't detect my initial command."
+FIX: moved creation of the level-check interval INTO ws.onopen, so it
+only starts running once the WebSocket connection is confirmed open —
+closing the gap entirely rather than trying to patch around it with
+more guards.
+VERIFICATION STATUS: this is a straightforward, clearly-traced ordering
+bug (not a documented external SDK limitation this time) — high
+confidence in the diagnosis, but still not re-tested on-device. This
+streaming path has now needed three real fixes in a row (turn-count
+concurrency, session.receive() looping, and now this connection-timing
+issue) — a genuinely harder, more failure-prone feature than the
+turn-based mode, consistent with it being explicitly flagged as the
+riskiest addition when first built.
