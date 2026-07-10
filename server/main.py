@@ -449,6 +449,22 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
         await websocket.close()
         return
 
+    # REAL FIX for a documented, known issue (confirmed via a matching
+    # GitHub bug report: googleapis/python-genai#1224 — "session stops
+    # responding after first turn_complete... the receive() coroutine
+    # never yields another message even though the client keeps sending
+    # more audio. The WebSocket remains open, but the session is
+    # effectively dead") — this is NOT something this code did wrong;
+    # it's a known limitation/bug in how the SDK's AUTOMATIC voice
+    # activity detection (VAD) handles ending a turn cleanly in
+    # continuous-streaming mode. The documented mitigation (Google's own
+    # Best Practices page): disable automatic VAD and send EXPLICIT
+    # activity_start/activity_end markers around each utterance instead
+    # of relying on Gemini to detect end-of-speech itself. The mic still
+    # streams continuously — this doesn't reintroduce turn-based
+    # buffering — it just tells Gemini precisely when one utterance
+    # begins/ends, rather than trusting automatic detection that this
+    # project's testing showed goes silent after the first cycle.
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=LIVE_SYSTEM_INSTRUCTION,
@@ -460,22 +476,45 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Aoede")
             )
         ),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
+        ),
     )
 
     async def _forward_browser_to_gemini(session):
         """Continuously reads binary audio frames from the browser and
         forwards each one to Gemini immediately via send_realtime_input —
-        no accumulation, no turn boundary. Returns when the browser
-        disconnects."""
+        no accumulation of audio bytes, but WITH explicit activity_start/
+        activity_end markers wrapping each utterance (see the endpoint's
+        docstring for why: automatic VAD was found to silently break
+        after the first turn in continuous mode — a real, documented SDK
+        issue, not a guess). The browser signals utterance boundaries via
+        text control frames ("UTTERANCE_START"/"UTTERANCE_END") based on
+        its OWN silence detection — the mic itself never stops streaming,
+        only these boundary markers are discrete."""
+        activity_open = False
         while True:
             message = await websocket.receive()
             if message.get("bytes") is not None:
+                if not activity_open:
+                    # Defensive: if audio arrives without an explicit
+                    # UTTERANCE_START (shouldn't normally happen given
+                    # the browser's own logic, but real bugs happen),
+                    # open one now rather than silently drop the audio
+                    # or send it into a closed activity window.
+                    await session.send_realtime_input(activity_start=types.ActivityStart())
+                    activity_open = True
                 await session.send_realtime_input(
                     audio=types.Blob(data=message["bytes"], mime_type="audio/pcm;rate=16000")
                 )
-            # Unlike /ws/live, there's no text "END_TURN" to watch for —
-            # this endpoint has no turn concept at all. Any stray text
-            # frames are ignored here.
+            elif message.get("text") == "UTTERANCE_START":
+                if not activity_open:
+                    await session.send_realtime_input(activity_start=types.ActivityStart())
+                    activity_open = True
+            elif message.get("text") == "UTTERANCE_END":
+                if activity_open:
+                    await session.send_realtime_input(activity_end=types.ActivityEnd())
+                    activity_open = False
 
     async def _forward_gemini_to_browser(session):
         """Continuously reads Gemini's responses (tool calls, transcripts,

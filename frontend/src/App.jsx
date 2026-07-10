@@ -206,6 +206,7 @@ export default function EdithHUD() {
   const streamAudioContextRef = useRef(null);
   const streamWorkletNodeRef = useRef(null);
   const streamMicStreamRef = useRef(null);
+  const streamLevelCheckIntervalRef = useRef(null);
   const nextPlayTimeRef = useRef(0); // AudioContext-relative time the NEXT chunk should start at
 
   const playStreamChunk = useCallback((arrayBuffer) => {
@@ -283,6 +284,56 @@ export default function EdithHUD() {
       const workletNode = new AudioWorkletNode(audioContext, 'pcm16-processor');
       streamWorkletNodeRef.current = workletNode;
 
+      // REAL SILENCE DETECTION, added specifically to work around a
+      // documented SDK issue (googleapis/python-genai#1224 — automatic
+      // VAD silently stops yielding responses after the first turn in
+      // continuous-streaming mode). Server-side, automatic VAD is now
+      // DISABLED and expects explicit activity_start/activity_end
+      // markers per utterance instead (Google's own documented
+      // workaround). This analyser measures REAL audio energy from the
+      // same mic stream to detect speech vs. silence and sends
+      // UTTERANCE_START/UTTERANCE_END text frames accordingly — the mic
+      // itself never stops streaming; only these boundary signals are
+      // discrete, so the experience is still "just talk," not a manual
+      // press-to-speak cycle.
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      const energyData = new Uint8Array(analyser.frequencyBinCount);
+
+      const SPEECH_THRESHOLD = 15; // empirical starting point; likely needs real-device tuning
+      const SILENCE_MS_TO_END_UTTERANCE = 800;
+      let isSpeaking = false;
+      let silenceTimer = null;
+
+      const checkAudioLevel = () => {
+        analyser.getByteFrequencyData(energyData);
+        const avg = energyData.reduce((sum, v) => sum + v, 0) / energyData.length;
+
+        if (avg > SPEECH_THRESHOLD) {
+          if (!isSpeaking) {
+            isSpeaking = true;
+            if (streamWsRef.current?.readyState === WebSocket.OPEN) {
+              streamWsRef.current.send('UTTERANCE_START');
+            }
+          }
+          if (silenceTimer) {
+            clearTimeout(silenceTimer);
+            silenceTimer = null;
+          }
+        } else if (isSpeaking && !silenceTimer) {
+          silenceTimer = setTimeout(() => {
+            isSpeaking = false;
+            silenceTimer = null;
+            if (streamWsRef.current?.readyState === WebSocket.OPEN) {
+              streamWsRef.current.send('UTTERANCE_END');
+            }
+          }, SILENCE_MS_TO_END_UTTERANCE);
+        }
+      };
+      const levelCheckInterval = setInterval(checkAudioLevel, 100);
+      streamLevelCheckIntervalRef.current = levelCheckInterval;
+
       const ws = new WebSocket(LIVE_STREAM_WS_URL);
       ws.binaryType = 'arraybuffer';
       streamWsRef.current = ws;
@@ -344,6 +395,10 @@ export default function EdithHUD() {
   }, [playStreamChunk, flushStreamPlayback]);
 
   const disconnectLiveStream = useCallback(() => {
+    if (streamLevelCheckIntervalRef.current) {
+      clearInterval(streamLevelCheckIntervalRef.current);
+      streamLevelCheckIntervalRef.current = null;
+    }
     streamWorkletNodeRef.current?.disconnect();
     streamMicStreamRef.current?.getTracks().forEach((track) => track.stop());
     streamAudioContextRef.current?.close();

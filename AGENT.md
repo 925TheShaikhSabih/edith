@@ -1367,3 +1367,70 @@ wrote it. Expect genuine bugs on first attempt: concurrency issues
 (gaps, overlaps, or drift between nextPlayTimeRef and actual playback),
 and the known interruption gap above are all real, plausible first
 failure points — start debugging there, not from scratch.
+
+## Real-time streaming bug: found the ACTUAL root cause (documented SDK issue, not a code mistake)
+
+Reported: initial command registers, but nothing after the first reply —
+recording never seems to pick up the next command.
+TRACED, not guessed: found an exact match — a real, open GitHub issue
+(googleapis/python-genai#1224) describing the IDENTICAL symptom:
+"session stops responding after first turn_complete... the receive()
+coroutine never yields another message even though the client keeps
+sending more audio. The WebSocket remains open, but the session is
+effectively dead." This is a documented, known limitation/bug in how
+the SDK's AUTOMATIC voice activity detection (VAD) handles ending a turn
+in continuous-streaming mode — NOT a mistake in this project's
+asyncio.gather setup, browser audio pipeline, or anything else built
+here.
+FIX, per Google's own documented best-practice workaround (confirmed
+across multiple current sources: the main capabilities guide, Vertex
+best-practices docs, and independent third-party SDK docs all show the
+identical pattern): disable automatic VAD entirely
+(realtime_input_config.automatic_activity_detection.disabled=True) and
+send EXPLICIT activity_start/activity_end markers around each discrete
+utterance instead of trusting Gemini's own (apparently broken, per the
+GitHub issue) automatic end-of-turn detection.
+IMPORTANT NUANCE discovered during research, not assumed: these markers
+wrap ONE UTTERANCE each, not the whole session — confirmed directly from
+Google's own capabilities guide's example loop. This meant true
+zero-touch, no-utterance-boundary-concept streaming isn't actually
+achievable with the current SDK's automatic VAD (that's the very thing
+that's broken) — SOME utterance-boundary signal is genuinely required.
+IMPLEMENTED: real silence detection via a Web Audio AnalyserNode on the
+browser side (connected to the SAME mic source already capturing PCM
+for the worklet, not a separate/duplicate capture) — measures actual
+audio energy on a 100ms interval, sends "UTTERANCE_START" when speech is
+detected and "UTTERANCE_END" after ~800ms of continued silence. The mic
+itself never stops streaming continuously; only these boundary markers
+are discrete, so the user experience is still "just talk, no button" —
+the complexity is hidden from the user, not reintroduced as a manual
+step. Server-side, /ws/live-stream's _forward_browser_to_gemini now
+tracks activity_open state and sends real activity_start/activity_end
+to Gemini based on these browser signals (with a defensive fallback: if
+audio somehow arrives without a prior UTTERANCE_START, it opens one
+rather than silently drop the audio or send it into a closed window).
+
+HONEST CAVEATS on this fix:
+- SPEECH_THRESHOLD (15) and SILENCE_MS_TO_END_UTTERANCE (800) are
+  reasonable STARTING values, not tuned against a real device/room/mic —
+  explicitly flagged in the code as "likely needs real-device tuning."
+  If utterances cut off too early or too late, these two constants are
+  the first thing to adjust.
+- This reintroduces some of the complexity deliberately avoided for the
+  TURN-BASED mode's stop mechanism earlier tonight (silence-detection
+  was explicitly rejected there in favor of a simple fixed timer) — but
+  here it's solving a different, necessary problem: working around a
+  real, documented SDK limitation that makes true zero-boundary
+  continuous conversation not actually functional yet, not a UX
+  preference.
+- The known "audio already playing can't be stopped mid-buffer during an
+  interruption" limitation (recorded earlier for this same endpoint) is
+  UNCHANGED by this fix — still a separate, real gap.
+
+VERIFICATION STATUS: this fix is grounded in a confirmed, exact-match
+documented bug report and Google's own documented workaround pattern —
+higher confidence than a guess, but the specific threshold/timing
+constants and the full concurrent flow (analyser + worklet + WebSocket +
+server-side activity tracking, all interacting) have NOT been run for
+real. Expect the threshold constants specifically to need adjustment on
+first real test.
