@@ -1434,3 +1434,49 @@ constants and the full concurrent flow (analyser + worklet + WebSocket +
 server-side activity tracking, all interacting) have NOT been run for
 real. Expect the threshold constants specifically to need adjustment on
 first real test.
+
+## Real-time streaming bug: ACTUAL root cause found (the VAD fix was solving an adjacent problem)
+
+User correction, taken at face value rather than defended against: the
+cutoff timing got WORSE after the VAD/silence-detection fix, but the
+CORE bug (nothing registers after Gemini's first reply) was IDENTICAL
+before and after that fix. This meant the VAD explanation, while
+grounded in a real, matching GitHub issue, was not actually this
+project's root cause.
+TRACED to the actual source this time: Google's own OFFICIAL Session
+Management guide (ai.google.dev/gemini-api/docs/live-session) shows
+their own recommended pattern for handling multiple turns:
+    while True:
+        await session.send_client_content(...)
+        async for message in session.receive():
+            ...
+This is the key insight: session.receive() is an async generator that
+COMPLETES after one logical exchange — this is DOCUMENTED, INTENDED
+behavior, not a bug in the SDK. The original _forward_gemini_to_browser
+called `async for response in session.receive()` exactly ONCE, with NO
+outer loop. After Gemini's first reply naturally finished generating,
+that generator completed and the function RETURNED — while
+asyncio.gather's sibling task (_forward_browser_to_gemini) kept running
+and kept sending the user's next utterance's audio into Gemini, with
+NOTHING left on our side consuming responses back out. This precisely
+explains the reported symptom: first command registers and gets a
+reply (because a receive() call was actively running for it), nothing
+registers after (because that call had already completed and returned,
+and nothing called it again).
+FIX: wrapped the async for in an outer `while True` loop, so
+session.receive() gets called again, fresh, every time the previous
+call's generator completes — matching Google's own documented pattern
+exactly. The server now keeps listening indefinitely across the whole
+streaming session, not just the first exchange.
+The earlier VAD/activity_start/activity_end/silence-detection work is
+LEFT IN PLACE (not reverted) — it's a real, legitimate mitigation for a
+genuinely documented, separate SDK issue (googleapis/python-genai#1224)
+that could still matter independently; it just wasn't THIS bug. The
+SPEECH_THRESHOLD/SILENCE_MS_TO_END_UTTERANCE tuning note from that fix
+still applies if utterance cutoff timing needs adjustment.
+VERIFICATION STATUS: this fix is grounded in Google's own official,
+directly-matching documented pattern (the clearest, most authoritative
+source found for this specific mechanic in this whole project) — high
+confidence, but genuinely not yet re-tested on-device. Given this is
+now the SECOND attempted fix for the same reported symptom, treat this
+as likely-correct-but-unconfirmed, not certain, until tested for real.

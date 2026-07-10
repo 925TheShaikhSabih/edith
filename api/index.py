@@ -519,61 +519,92 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
     async def _forward_gemini_to_browser(session):
         """Continuously reads Gemini's responses (tool calls, transcripts,
         reply audio chunks, and interruption signals) and forwards each
-        to the browser AS IT ARRIVES — no buffering until a turn ends,
-        because there is no turn end on this endpoint."""
-        async for response in session.receive():
-            if response.tool_call:
-                function_responses = []
-                for fc in response.tool_call.function_calls:
-                    await websocket.send_json({"type": "tool_used", "name": fc.name})
-                    tool_fn = live_tool_registry.get(fc.name)
-                    kwargs = getattr(fc, "args", getattr(fc, "arguments", {})) or {}
-                    if tool_fn is None:
-                        result = {"ok": False, "error": f"no tool named {fc.name!r}"}
-                    else:
-                        try:
-                            result = tool_fn(**kwargs)
-                        except Exception as e:
-                            result = {"ok": False, "error": str(e)}
-                    function_responses.append(
-                        types.FunctionResponse(name=fc.name, id=fc.id, response={"result": result})
-                    )
-                await session.send_tool_response(function_responses=function_responses)
+        to the browser AS IT ARRIVES.
 
-            content = response.server_content
-            if not content:
-                continue
+        THE ACTUAL ROOT CAUSE FIX, found via Google's own official
+        Session Management guide (not the VAD explanation tried
+        earlier — that was grounded in real research but was solving an
+        adjacent problem): session.receive() is an async generator that
+        naturally completes after ONE logical exchange — this is
+        DOCUMENTED, INTENDED behavior, not a bug. Google's own
+        recommended pattern for multi-turn sessions explicitly shows
+        `receive()` called INSIDE an outer `while True` loop, fresh for
+        each new exchange:
+            while True:
+                await session.send_client_content(...)
+                async for message in session.receive():
+                    ...
+        The original version of this function called `async for response
+        in session.receive()` exactly ONCE, with no outer loop — meaning
+        after Gemini's first reply naturally finished, this generator
+        completed and the function RETURNED. asyncio.gather's other task
+        (_forward_browser_to_gemini) kept running and kept sending audio
+        into Gemini, but nothing was left consuming responses back out —
+        explaining precisely the reported symptom: first command works,
+        nothing registers after.
+        The outer `while True` here re-calls session.receive() every
+        time the inner loop completes, so the server keeps listening
+        indefinitely across the whole streaming session, not just the
+        first exchange."""
+        while True:
+            async for response in session.receive():
+                if response.tool_call:
+                    function_responses = []
+                    for fc in response.tool_call.function_calls:
+                        await websocket.send_json({"type": "tool_used", "name": fc.name})
+                        tool_fn = live_tool_registry.get(fc.name)
+                        kwargs = getattr(fc, "args", getattr(fc, "arguments", {})) or {}
+                        if tool_fn is None:
+                            result = {"ok": False, "error": f"no tool named {fc.name!r}"}
+                        else:
+                            try:
+                                result = tool_fn(**kwargs)
+                            except Exception as e:
+                                result = {"ok": False, "error": str(e)}
+                        function_responses.append(
+                            types.FunctionResponse(name=fc.name, id=fc.id, response={"result": result})
+                        )
+                    await session.send_tool_response(function_responses=function_responses)
 
-            # NEW vs. /ws/live: real-time streaming means the user can
-            # start talking again while Gemini is still replying.
-            # Confirmed via Google's own Vertex docs: this is the signal
-            # to tell the browser to immediately stop/flush whatever
-            # reply audio it has queued, rather than keep talking over
-            # the user. /ws/live never needed this since it always
-            # waited for one full reply before allowing the next turn.
-            if content.interrupted:
-                await websocket.send_json({"type": "interrupted"})
-                continue
+                content = response.server_content
+                if not content:
+                    continue
 
-            if content.input_transcription and content.input_transcription.text:
-                await websocket.send_json({
-                    "type": "input_transcript",
-                    "text": content.input_transcription.text,
-                })
-            if content.output_transcription and content.output_transcription.text:
-                await websocket.send_json({
-                    "type": "output_transcript",
-                    "text": content.output_transcription.text,
-                })
-            if content.model_turn:
-                for part in content.model_turn.parts:
-                    if part.inline_data:
-                        # Sent AS A SMALL CHUNK immediately, NOT buffered
-                        # until some turn-end signal — there is no
-                        # turn-end concept here, so buffering would just
-                        # mean waiting arbitrarily and defeating the
-                        # entire point of streaming.
-                        await websocket.send_bytes(part.inline_data.data)
+                # NEW vs. /ws/live: real-time streaming means the user can
+                # start talking again while Gemini is still replying.
+                # Confirmed via Google's own Vertex docs: this is the signal
+                # to tell the browser to immediately stop/flush whatever
+                # reply audio it has queued, rather than keep talking over
+                # the user. /ws/live never needed this since it always
+                # waited for one full reply before allowing the next turn.
+                if content.interrupted:
+                    await websocket.send_json({"type": "interrupted"})
+                    continue
+
+                if content.input_transcription and content.input_transcription.text:
+                    await websocket.send_json({
+                        "type": "input_transcript",
+                        "text": content.input_transcription.text,
+                    })
+                if content.output_transcription and content.output_transcription.text:
+                    await websocket.send_json({
+                        "type": "output_transcript",
+                        "text": content.output_transcription.text,
+                    })
+                if content.model_turn:
+                    for part in content.model_turn.parts:
+                        if part.inline_data:
+                            # Sent AS A SMALL CHUNK immediately, NOT buffered
+                            # until some turn-end signal — there is no
+                            # turn-end concept here, so buffering would just
+                            # mean waiting arbitrarily and defeating the
+                            # entire point of streaming.
+                            await websocket.send_bytes(part.inline_data.data)
+            # Inner `async for` completed (Gemini finished one logical
+            # exchange) — loop back to the top of `while True` and call
+            # session.receive() again, fresh, per the documented pattern.
+            # Without this outer loop, the function would return here and
+            # silently stop listening for anything further.
 
     try:
         async with client.aio.live.connect(model=LIVE_MODEL_NAME, config=config) as session:
