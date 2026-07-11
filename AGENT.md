@@ -1513,3 +1513,124 @@ concurrency, session.receive() looping, and now this connection-timing
 issue) — a genuinely harder, more failure-prone feature than the
 turn-based mode, consistent with it being explicitly flagged as the
 riskiest addition when first built.
+
+## Moving hosting: Vercel -> Oracle Cloud (persistent server, existing account)
+
+Per explicit decision, once true continuous streaming (/ws/live-stream)
+started working: Vercel's serverless model, while confirmed technically
+functional for this project's WebSocket endpoints all night, was never
+actually the intended path (a current 2026 comparison source states
+directly: "Vercel and Netlify... Not suitable for WebSocket or real-time
+Node.js applications") — and its documented instance-recycling
+possibility ("not guaranteed to reach the same instance") went from a
+theoretical risk to a real, meaningful one the moment a continuous,
+stateful Gemini Live session became the actual feature, not a turn-based
+one.
+RESEARCHED free-tier alternatives extensively before this decision:
+Render (confirmed card-gated for some accounts, a real, documented,
+unresolved issue), Railway/Fly.io (both now trial-credit models, not
+permanent free, per multiple 2026 sources), PythonAnywhere (free tier
+explicitly excludes ASGI/WebSocket apps per their own docs), Oracle
+Cloud Always Free (genuinely requires a card for the vast majority of
+new signups per Oracle's own FAQ, plus real user reports of "out of
+capacity" issues even with a card provided). Given the user ALREADY HAS
+an Oracle account (with an existing Japan-region instance), this
+sidesteps the signup-friction question entirely and became the practical
+choice.
+BUILT: Dockerfile (persistent server deployment, EXCLUDES vosk/piper-tts
+from the container since server/main.py never imports either — confirmed
+via direct grep — those are only used by main_voice_local.py, an
+unrelated phone-native experiment); requirements-server.txt (a
+server-specific dependency list, separate from the project's main
+requirements.txt, for the same reason); DEPLOY_ORACLE.md (step-by-step
+guide: SSH in, install Docker, clone the repo, set secrets via .env,
+build+run with --restart unless-stopped for real crash/reboot
+resilience, and — flagged as a real, common Oracle-specific gotcha —
+opening the port in BOTH the instance's own iptables AND Oracle's
+separate cloud-level Security List/NSG, since missing either leaves the
+container running but completely unreachable).
+NOT YET RUN: this deployment path is genuinely untested end-to-end — no
+way to actually build/run Docker or reach a real Oracle instance from
+this environment. The most likely first snag, flagged directly in
+DEPLOY_ORACLE.md: the dual-firewall-layer step, since that's a
+well-known, easy-to-miss specific to Oracle Cloud's networking model.
+
+## Adopted from an external iOS-quirks reference doc: two proactive fixes
+
+User shared a battle-tested "voice-first mobile PWA" prompt (written for
+a DIFFERENT architecture — desktop-first agent gaining a phone
+companion, MP3-based TTS, a separate STT/TTS pipeline) and asked whether
+anything strengthens our actual mobile-first, Gemini-Live-native setup.
+Evaluated each of its 9 iOS-specific lessons against what's already
+built — most didn't transfer (different audio pipeline: we use raw PCM
+via Live directly, not MP3 from a separate TTS provider; different
+persistence model; no auth built yet so the token-header lesson isn't
+actionable yet) or were already solved differently by existing fixes
+(the two-AudioContext split already addresses a similar problem to their
+dual-path audio pattern, for a different but related reason).
+TWO items were genuinely, directly applicable and adopted now:
+1. **§4's NotAllowedError-after-await fix**: a real, silent WAV data URI
+   audio element, play()+pause()'d SYNCHRONOUSLY inside connectVoice/
+   connectLiveStream's click handlers, before any await. This is MORE
+   ROBUST than the existing "resume() if suspended" checks scattered at
+   each playback call site (which only handle a context suspended AFTER
+   being granted activation) — this prevents ever FAILING to be granted
+   activation in the first place, which matters specifically because
+   Gemini's reply always arrives after a real async network round-trip.
+2. **§9's AudioContext re-suspension fix**: iOS suspends AudioContexts on
+   backgrounding/lock-screen/route-changes — added an
+   ensureAudioContextsAwake() helper, called at the top of every connect,
+   that resume()s all three AudioContexts (capture, playback, and the
+   streaming-mode's separate capture context) on every real user gesture.
+Both implemented as shared helper functions (primeIOSAudioActivation,
+ensureAudioContextsAwake), called from BOTH connectVoice (turn-based) and
+connectLiveStream (real-time streaming) — not duplicated per-mode.
+Deliberately defined BEFORE both connect functions in the file (not
+relying on closure-timing reasoning about references-before-declaration
+a second time tonight, after several genuine closure-ordering bugs
+already traced and fixed elsewhere in this session) — verified via
+direct line-number check that both helpers textually precede both
+callers, removing any ordering ambiguity rather than just reasoning
+about whether it would be safe.
+The remaining, currently-inapplicable lessons from that reference doc
+(PWA cache-busting/no-store headers, viewport-fit=cover/100dvh, the
+dual-header-plus-query-param auth token pattern) are worth revisiting
+specifically WHEN EdithHUD becomes an actual installed home-screen PWA
+or gets real authentication — not relevant to today's PlayCode-based
+testing setup, but real, concrete next steps for those future moments.
+VERIFICATION STATUS: structurally sound (compiles, correct ordering
+confirmed), but NOT yet tested on a real iOS device — these are
+proactive fixes for failure modes not yet personally hit in this
+project (unlike most of tonight's other fixes, which were reactive
+traces of actual reported bugs). Worth testing specifically on an
+iPhone/iOS Safari when possible, since that's the one browser
+environment where these particular fixes matter most and PlayCode
+testing (likely on desktop) won't exercise this code path at all.
+
+## Cross-platform scope, clarified: browser-dependent, not strictly OS-dependent
+
+User asked directly whether the setup is meant to run on both iOS and
+Android. Honest answer: yes, that's the intent, and the core APIs used
+(AudioWorklet, getUserMedia, AudioContext, WebSocket) are standard, not
+iOS-specific — so this should broadly hold. The more ACCURATE framing,
+worth keeping in mind going forward: compatibility is driven by BROWSER
+choice more than OS choice. Confirmed gap: the wake-word feature's
+SpeechRecognition (Web Speech API) explicitly excludes Firefox on EITHER
+platform (behind a disabled-by-default flag per research done when that
+feature was built) — Chrome/Android and Safari/iOS both support it,
+Firefox on neither does.
+The two iOS-quirks fixes just added (primeIOSAudioActivation,
+ensureAudioContextsAwake) are DELIBERATELY asymmetric — they matter most
+on iOS Safari specifically (stricter autoplay/backgrounding policies)
+and are designed to be harmless no-ops elsewhere (primeIOSAudioActivation
+swallows its own rejection specifically so a non-iOS browser where this
+priming isn't needed doesn't see any error). This is correct behavior,
+not a platform gap.
+HONEST, UNCONFIRMED STATUS: nothing in this project has been tested on a
+real iPhone yet. PlayCode's actual test environment is unconfirmed but
+plausibly desktop-browser-based, meaning the iOS-specific code paths
+added tonight haven't been genuinely exercised at all. Android/Chrome is
+a reasonably safe bet to "just work" given it's closer to how these web
+APIs are typically developed/tested first — but that's an informed
+expectation, not a confirmed result, stated as such rather than
+overclaimed.

@@ -1,0 +1,25 @@
+# Requirements for the DEPLOYED SERVER ONLY (server/main.py / api/index.py).
+#
+# Deliberately excludes vosk and piper-tts, which appear in the project's
+# main requirements.txt but are ONLY imported by main_voice_local.py — a
+# phone-native/Termux experiment (confirmed blocked earlier: no working
+# install path found on Termux) that has nothing to do with this server.
+# Confirmed via direct grep that neither server/main.py nor api/index.py
+# import vosk or piper anywhere.
+#
+# Also excludes the earlier Termux-specific native-build workarounds
+# (cryptography/pydantic-core toolchain notes in the main requirements.txt) —
+# those were needed to work around Termux's aarch64-linux-android platform
+# tag mismatch specifically. A standard Oracle Cloud Linux VM has normal
+# glibc/manylinux wheel support, so those workarounds shouldn't be needed
+# here — but if `pip install -r requirements-server.txt` fails on
+# cryptography or pydantic-core for any reason, that's the history to
+# check first (see AGENT.md's Termux dependency notes) rather than assume
+# it's a wholly new problem.
+
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+websockets>=13.0
+elevenlabs>=1.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
