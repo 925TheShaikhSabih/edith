@@ -1634,3 +1634,99 @@ a reasonably safe bet to "just work" given it's closer to how these web
 APIs are typically developed/tested first — but that's an informed
 expectation, not a confirmed result, stated as such rather than
 overclaimed.
+
+## Real-time streaming: 1011 + 1007 errors, likely root cause found and fixed (session lifetime, not VAD)
+
+Reported: "Live stream session error: 1011 None. Internal error
+encountered." and "Live stream session error: 1007 None. Precondition
+check failed." — both appearing together during extended testing.
+Confirmed via direct question that testing was still against the OLD
+Vercel deployment (Oracle not yet live), ruling out a Japan-region
+location-support theory that initially looked plausible given 1007's
+common "User location not supported" meaning documented elsewhere.
+TRACED to a genuinely better-fitting, more complete explanation than
+either error alone suggested: Google's own current docs (Session
+Management guide + a 2026-06-30-dated Troubleshooting guide — both
+highly authoritative, recent sources) confirm a Live WebSocket
+connection has a HARD, DOCUMENTED lifetime of ~10 minutes (audio-only
+sessions further capped around 15 minutes of context) — the server
+sends a GoAway warning first, but terminates regardless if unhandled.
+Confirmed via direct grep: this server had ZERO handling for go_away or
+session_resumption anywhere. An unhandled natural session expiry during
+a longer test session explains BOTH errors as one coherent story rather
+than two unrelated bugs: an abrupt server-side termination (1011),
+followed by this server's local activity_open tracking being left out
+of sync with a session that no longer existed (1007) — rather than the
+VAD/activity-marker logic itself being newly broken.
+FIX, implemented per Google's own documented pattern (confirmed
+correct field names — response.go_away, response.session_resumption_update
+— via a DIRECT, exact-syntax code match in an independent Medium
+walkthrough, not just doc prose):
+1. Enabled session_resumption in the config (transparent=True, per
+   Google's own best-practices doc — enables replaying unconsumed
+   messages on reconnect, strictly better than the bare option).
+2. _forward_gemini_to_browser now captures the resumption handle from
+   session_resumption_update messages as they periodically arrive, and
+   cleanly RETURNS (rather than erroring) when a go_away signal is
+   received, notifying the browser via a new "reconnecting" message type.
+3. The single-shot `async with client.aio.live.connect(...)` block was
+   replaced with a genuine reconnection loop (capped at 5 attempts) that,
+   after a clean go_away-triggered return, reconnects using the saved
+   handle — continuing the SAME logical conversation with context
+   intact, rather than erroring out and requiring the user to manually
+   reconnect and lose context.
+The earlier VAD/activity-marker fix is UNCHANGED and still believed
+correct for the separate, real issue it was built for (automatic VAD
+silently breaking after the first turn) — this session-lifetime fix is
+additive, not a replacement or contradiction of that work.
+VERIFICATION STATUS: grounded in Google's own current, dated, and
+independently-cross-confirmed documentation for both the underlying
+cause (documented session lifetime) and the exact fix shape (go_away/
+session_resumption_update field names, confirmed via an exact syntax
+match in a real code sample) — meaningfully higher confidence than
+earlier fixes in this streaming feature, which were traced from a single
+matching bug report rather than official, current, authoritative docs.
+Still NOT yet tested for real — this is genuinely a bigger, more
+structural change (a reconnection loop, not a single-line fix) than
+most of tonight's other fixes, and deserves a real test specifically
+across a SESSION LONG ENOUGH to hit the ~10 minute boundary, not just a
+quick connect/disconnect check.
+
+## Real-time streaming chunk size: adjusted (not to turn-based-mode's size, for a real reason)
+
+User asked whether real-time streaming could send/receive larger chunks
+like turn-based mode. Direct answer: NOT to turn-based mode's chunk
+size — that would defeat continuous streaming's actual purpose (Google's
+own best-practices doc: "send small chunks between 20ms and 40ms to
+minimize latency," specifically so audio reaches Gemini as it's captured
+rather than after a delay).
+BUT checked our actual current chunk size against that guidance rather
+than just say no: the AudioWorklet's process() callback is called once
+per Web-Audio-spec-fixed "render quantum" (128 samples), which at our
+16kHz capture rate is 8ms per call — SMALLER than Google's own 20-40ms
+recommendation, not larger. We were sending every single 8ms call as
+its own WebSocket message: roughly 4-5x more messages than the
+responsiveness real-time streaming needs actually requires.
+FIX: the worklet now buffers 4 process() calls (512 samples = 32ms,
+calculated to land inside Google's documented 20-40ms range) before
+sending one combined message, instead of sending on every call. Real
+reduction in WebSocket message overhead (~4x fewer sends) without
+pushing latency past what Google's own guidance calls acceptable for
+this exact use case — a genuine middle ground between "turn-based mode's
+large buffered blob" (defeats streaming's purpose) and "the previous
+8ms-per-message granularity" (finer than necessary).
+Checked before shipping: both consumer sites (the streaming panel's
+worklet handler and the turn-based panel's, which shares the same
+PCM_WORKLET_SOURCE) just forward event.data directly to ws.send()/
+session.send_realtime_input() with no assumption baked in about a fixed
+message length — this change is safe on both the browser and server
+side without any other code needing to change.
+VERIFICATION STATUS: the math (128 samples/16kHz = 8ms; 4x that = 32ms)
+is exact and verifiable, and the implementation is a small, contained
+change to a single, already-shared function — reasonably low risk, but
+genuinely untested on-device. Worth confirming this doesn't introduce
+any perceptible new lag, and that the reduced message count doesn't
+interact oddly with the silence-detection interval (which runs on its
+own separate 100ms timer, unrelated to worklet message timing, so it
+shouldn't be affected — but noted as the thing to watch if anything
+about utterance-boundary timing feels different after this change).

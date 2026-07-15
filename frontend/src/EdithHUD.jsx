@@ -20,7 +20,7 @@ const COLORS = {
   paper: '#E8E8E8',
 };
 
-const DEFAULT_WS_URL = 'ws://140.245.81.217:8000/ws';
+const DEFAULT_WS_URL = 'wss://edith-flame.vercel.app/ws';
 const LIVE_WS_URL = DEFAULT_WS_URL.replace(/\/ws$/, '/ws/live');
 const LIVE_STREAM_WS_URL = DEFAULT_WS_URL.replace(/\/ws$/, '/ws/live-stream');
 
@@ -37,6 +37,30 @@ function useRadialTicks(count, radius) {
 
 const PCM_WORKLET_SOURCE = `
 class PCM16Processor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    // Buffers multiple process() calls before sending, rather than
+    // sending on every single call. The Web Audio spec fixes each
+    // process() call's input to exactly 128 samples (a "render
+    // quantum") — at 16kHz that's 8ms per call, which is SMALLER than
+    // Google's own documented recommendation for Live streaming ("send
+    // small chunks between 20ms and 40ms to minimize latency"). Sending
+    // every single 8ms call as its own WebSocket message means ~4-5x
+    // more messages than necessary for the responsiveness real-time
+    // streaming actually needs. Buffering 4 calls (512 samples = 32ms)
+    // lands inside that documented sweet spot: real savings on message
+    // overhead without pushing latency past what Google's own guidance
+    // calls acceptable for this exact use case. NOT the same as turn-
+    // based mode's much larger buffered-utterance chunks — that would
+    // defeat real-time streaming's entire point (audio reaching Gemini
+    // as it's captured, so it can respond or be interrupted without
+    // waiting for a full utterance) — this is a much smaller, bounded
+    // batch specifically sized to Google's own latency guidance, not an
+    // unbounded buffer.
+    this.chunksToBuffer = 4;
+    this.bufferedChunks = [];
+  }
+
   process(inputs) {
     const input = inputs[0];
     if (input && input[0]) {
@@ -46,7 +70,19 @@ class PCM16Processor extends AudioWorkletProcessor {
         const s = Math.max(-1, Math.min(1, float32[i]));
         int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
       }
-      this.port.postMessage(int16.buffer, [int16.buffer]);
+      this.bufferedChunks.push(int16);
+
+      if (this.bufferedChunks.length >= this.chunksToBuffer) {
+        const totalLength = this.bufferedChunks.reduce((sum, c) => sum + c.length, 0);
+        const combined = new Int16Array(totalLength);
+        let offset = 0;
+        for (const chunk of this.bufferedChunks) {
+          combined.set(chunk, offset);
+          offset += chunk.length;
+        }
+        this.bufferedChunks = [];
+        this.port.postMessage(combined.buffer, [combined.buffer]);
+      }
     }
     return true;
   }
@@ -76,6 +112,23 @@ export default function EdithHUD() {
   const workletNodeRef = useRef(null);
   const micStreamRef = useRef(null);
   const playbackQueueRef = useRef([]);
+
+  // Silent-audio priming element, per the iOS-quirks reference doc's §4
+  // pattern: a real <audio> element with a genuine (tiny, silent) WAV
+  // data URI, played+paused SYNCHRONOUSLY inside a click handler. iOS
+  // Safari's user-activation window only persists across SYNCHRONOUS
+  // code in the click handler — any `await` before the first play()
+  // call can silently revoke it, causing a later, async playback
+  // attempt to reject with NotAllowedError even though it's clearly
+  // triggered by a real user action. A successful play() *inside* the
+  // gesture grants permanent activation for the page's lifetime, so
+  // every later async playback (e.g. Gemini's reply arriving after a
+  // network round-trip) succeeds. This is DIFFERENT from, and more
+  // robust than, the existing "resume() if suspended" checks scattered
+  // at each playback call site below — those handle a context that's
+  // been suspended AFTER being granted activation; this prevents ever
+  // failing to be granted it in the first place.
+  const silentAudioRef = useRef(null);
 
   const outerTicks = useRadialTicks(48, 140);
   const innerTicks = useRadialTicks(24, 110);
@@ -258,7 +311,59 @@ export default function EdithHUD() {
     }
   }, []);
 
+  // Primes iOS Safari's user-activation for the whole page lifetime.
+  // MUST be called SYNCHRONOUSLY, as literally the first thing inside a
+  // click handler — before any `await`, before any async function call.
+  // Per the iOS-quirks reference doc's §4: iOS's activation window only
+  // persists across synchronous code; a successful play() (even of a
+  // silent, near-zero-length WAV) inside that window is what grants
+  // permanent activation, allowing every LATER async playback (e.g. a
+  // Gemini reply arriving after a real network round-trip) to actually
+  // work instead of silently rejecting with NotAllowedError. This isn't
+  // a replacement for the existing "resume() if suspended" checks
+  // scattered at each playback call site — those still matter for a
+  // context that's been suspended by backgrounding/lock-screen after
+  // activation was already granted (see ensureAudioContextsAwake below,
+  // §9's fix) — this specifically prevents ever FAILING to be granted
+  // activation in the first place.
+  // Defined here, BEFORE both connectLiveStream and connectVoice
+  // (deliberately, not relying on closure-timing reasoning about
+  // functions-referenced-before-declaration a second time tonight) —
+  // no ordering ambiguity this way, at all.
+  const primeIOSAudioActivation = useCallback(() => {
+    if (silentAudioRef.current) {
+      silentAudioRef.current
+        .play()
+        .then(() => silentAudioRef.current?.pause())
+        .catch(() => {
+          // A rejection here is fine and expected on non-iOS browsers
+          // that don't need this priming at all — never treat this as
+          // a real error worth surfacing to the transcript.
+        });
+    }
+  }, []);
+
+  // §9's fix: iOS suspends AudioContexts on backgrounding, lock screen,
+  // and audio-route changes (e.g. plugging in headphones). Called at the
+  // top of every user-gesture-triggered connect, so both the capture and
+  // playback contexts get a fresh resume() attempt on every real click —
+  // keeps them warm rather than silently staying suspended after the
+  // FIRST backgrounding event of a session.
+  const ensureAudioContextsAwake = useCallback(() => {
+    if (playbackContextRef.current?.state === 'suspended') {
+      playbackContextRef.current.resume();
+    }
+    if (audioContextRef.current?.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
+    if (streamAudioContextRef.current?.state === 'suspended') {
+      streamAudioContextRef.current.resume();
+    }
+  }, []);
+
   const connectLiveStream = useCallback(async () => {
+    primeIOSAudioActivation();
+    ensureAudioContextsAwake();
     setStreamState('connecting');
 
     if (!playbackContextRef.current || playbackContextRef.current.state === 'closed') {
@@ -331,8 +436,6 @@ export default function EdithHUD() {
           }, SILENCE_MS_TO_END_UTTERANCE);
         }
       };
-      const levelCheckInterval = setInterval(checkAudioLevel, 100);
-      streamLevelCheckIntervalRef.current = levelCheckInterval;
 
       const ws = new WebSocket(LIVE_STREAM_WS_URL);
       ws.binaryType = 'arraybuffer';
@@ -349,6 +452,21 @@ export default function EdithHUD() {
 
       ws.onopen = () => {
         source.connect(workletNode);
+        // THE ACTUAL FIX: the silence-detection interval is started
+        // HERE, only after the WebSocket has genuinely finished
+        // connecting — NOT immediately when connectLiveStream runs (the
+        // real bug in the previous version). Previously, checkAudioLevel
+        // could detect speech and set isSpeaking=true internally BEFORE
+        // streamWsRef.current existed or was OPEN — the `readyState ===
+        // OPEN` guard silently skipped sending UTTERANCE_START in that
+        // window rather than erroring, so speech during the brief
+        // connection delay (which very plausibly includes a user's
+        // FIRST utterance, spoken right after clicking connect) was
+        // detected locally but never actually communicated to the
+        // server at all. Starting the interval only once the socket is
+        // confirmed open closes this gap entirely.
+        const levelCheckInterval = setInterval(checkAudioLevel, 100);
+        streamLevelCheckIntervalRef.current = levelCheckInterval;
         setTranscript((t) => [...t, { type: 'system', text: 'Real-time stream connecting...' }]);
       };
 
@@ -407,6 +525,8 @@ export default function EdithHUD() {
   }, []);
 
   const connectVoice = useCallback(() => {
+    primeIOSAudioActivation();
+    ensureAudioContextsAwake();
     setVoiceState('connecting');
     
     // Instantiate or revive the dedicated playback infrastructure securely on explicit User Click Gesture
@@ -767,6 +887,18 @@ export default function EdithHUD() {
         boxSizing: 'border-box',
       }}
     >
+      {/* Silent priming element, per the iOS-quirks reference doc's §4
+          pattern. Genuinely inaudible (a real, tiny, silent WAV) — its
+          only purpose is to be play()'d synchronously inside a click
+          handler so iOS Safari grants permanent user-activation for the
+          rest of the page's lifetime. Hidden, not interactive. */}
+      <audio
+        ref={silentAudioRef}
+        playsInline
+        preload="auto"
+        src="data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA=="
+        style={{ display: 'none' }}
+      />
       <div
         style={{
           width: '100%',

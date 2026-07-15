@@ -465,6 +465,26 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
     # buffering — it just tells Gemini precisely when one utterance
     # begins/ends, rather than trusting automatic detection that this
     # project's testing showed goes silent after the first cycle.
+    # REAL FIX for likely root cause of BOTH reported errors (1011
+    # Internal error, 1007 Precondition failed): confirmed via Google's
+    # own current docs (Session Management guide + Troubleshooting guide,
+    # both dated 2026) that a single Live WebSocket connection has a
+    # hard, documented lifetime of ~10 minutes, and audio-only sessions
+    # are capped around 15 minutes of context — the server sends a
+    # GoAway warning first, but terminates regardless if nothing handles
+    # it. This server had ZERO handling for this (confirmed via direct
+    # grep: no go_away or session_resumption references anywhere) —a
+    # natural, DOCUMENTED session expiry during a longer test session is
+    # a strong, better-fitting explanation for both errors together than
+    # either in isolation: an unhandled termination (1011) followed by
+    # this server's local activity_open tracking being out of sync with
+    # a session that no longer exists (1007) is a coherent single story,
+    # not two unrelated bugs.
+    # session_resumption=types.SessionResumptionConfig() (empty config)
+    # enables the server to periodically send resumption handles, which
+    # get captured below and used to reconnect seamlessly if the
+    # connection is terminated — rather than the previous behavior of
+    # just surfacing an error and stopping.
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=LIVE_SYSTEM_INSTRUCTION,
@@ -479,7 +499,17 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
         ),
+        session_resumption=types.SessionResumptionConfig(transparent=True),
     )
+
+    # Shared mutable state: _forward_gemini_to_browser writes the latest
+    # resumption handle here as it arrives; the outer reconnection loop
+    # (below, replacing the old single `async with` block) reads it when
+    # deciding how to reconnect after a go_away/termination. A plain dict
+    # (not a local variable) since it needs to be visible across the
+    # async function boundary and survive being read after
+    # _forward_gemini_to_browser returns.
+    resumption_state = {"handle": None}
 
     async def _forward_browser_to_gemini(session):
         """Continuously reads binary audio frames from the browser and
@@ -548,6 +578,29 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
         first exchange."""
         while True:
             async for response in session.receive():
+                # Capture the resumption handle as it's periodically sent
+                # by the server (confirmed via Google's own Session
+                # Management guide) — stored in resumption_state, a
+                # mutable dict the OUTER reconnection loop (below) reads
+                # from, so a future reconnect can resume this exact
+                # session with its context intact rather than starting
+                # fresh.
+                if response.session_resumption_update:
+                    update = response.session_resumption_update
+                    if update.resumable and update.new_handle:
+                        resumption_state["handle"] = update.new_handle
+
+                # A GoAway signal means the server will terminate this
+                # connection soon (documented: ~60 seconds' notice).
+                # Rather than let this surface as an unhandled 1011/1007
+                # later when the connection actually drops, break out of
+                # BOTH loops cleanly now — the outer reconnection wrapper
+                # (below) will reconnect using the resumption handle
+                # captured above.
+                if response.go_away:
+                    await websocket.send_json({"type": "reconnecting"})
+                    return
+
                 if response.tool_call:
                     function_responses = []
                     for fc in response.tool_call.function_calls:
@@ -606,25 +659,69 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
             # Without this outer loop, the function would return here and
             # silently stop listening for anything further.
 
-    try:
-        async with client.aio.live.connect(model=LIVE_MODEL_NAME, config=config) as session:
-            await websocket.send_json({"type": "live_ready"})
-            # Run both directions CONCURRENTLY — this is the actual
-            # structural change from /ws/live's one sequential loop.
-            # asyncio.gather with return_exceptions=False (default) means
-            # if EITHER task raises (e.g. the browser disconnects, which
-            # surfaces as a WebSocketDisconnect from the receive() call
-            # inside _forward_browser_to_gemini), the whole gather stops.
-            await asyncio.gather(
-                _forward_browser_to_gemini(session),
-                _forward_gemini_to_browser(session),
-            )
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
+    # Reconnection loop, replacing the previous single-shot `async with`.
+    # This is the actual structural fix for the reported errors: Gemini
+    # Live connections have a hard, documented ~10 minute lifetime (see
+    # the config block's comment above for sources) — the server warns
+    # via go_away, but WILL terminate regardless. Previously, that
+    # termination surfaced as an unhandled error (1011, and a follow-on
+    # 1007 from this server's local state being out of sync with a
+    # session that no longer existed) and stopped the whole endpoint.
+    # Now: a go_away causes _forward_gemini_to_browser to return cleanly
+    # (see its go_away check above), and this outer loop reconnects using
+    # the resumption handle captured along the way — continuing the
+    # conversation with its context intact rather than erroring out.
+    MAX_RECONNECT_ATTEMPTS = 5
+    attempt = 0
+    while attempt < MAX_RECONNECT_ATTEMPTS:
+        attempt += 1
         try:
-            await websocket.send_json({"type": "error", "text": f"Live stream session error: {e}"})
-        except Exception:
-            pass
-    finally:
-        print(f"[live-stream session {session_id}] disconnected")
+            connect_config = config
+            if resumption_state["handle"]:
+                # Reconnecting after a go_away — pass the saved handle so
+                # Gemini resumes this exact session's context rather than
+                # starting a brand new one. Everything else in config
+                # (tools, system instruction, voice, etc.) stays the same;
+                # only session_resumption's handle changes.
+                connect_config = types.LiveConnectConfig(
+                    response_modalities=config.response_modalities,
+                    system_instruction=config.system_instruction,
+                    tools=config.tools,
+                    input_audio_transcription=config.input_audio_transcription,
+                    output_audio_transcription=config.output_audio_transcription,
+                    speech_config=config.speech_config,
+                    realtime_input_config=config.realtime_input_config,
+                    session_resumption=types.SessionResumptionConfig(
+                        handle=resumption_state["handle"], transparent=True
+                    ),
+                )
+
+            async with client.aio.live.connect(model=LIVE_MODEL_NAME, config=connect_config) as session:
+                await websocket.send_json({"type": "live_ready"})
+                # Run both directions CONCURRENTLY — this is the actual
+                # structural change from /ws/live's one sequential loop.
+                # asyncio.gather with return_exceptions=False (default)
+                # means if EITHER task raises (e.g. the browser
+                # disconnects, which surfaces as a WebSocketDisconnect
+                # from the receive() call inside _forward_browser_to_gemini),
+                # the whole gather stops.
+                await asyncio.gather(
+                    _forward_browser_to_gemini(session),
+                    _forward_gemini_to_browser(session),
+                )
+            # If we reach here, _forward_gemini_to_browser returned on
+            # its own (the go_away path) rather than the gather raising —
+            # loop back and reconnect using the handle captured above.
+            # If neither task ever returns/raises normally (the ongoing,
+            # healthy-connection case), this line is simply never reached
+            # until a real disconnect or go_away happens.
+        except WebSocketDisconnect:
+            break
+        except Exception as e:
+            try:
+                await websocket.send_json({"type": "error", "text": f"Live stream session error: {e}"})
+            except Exception:
+                pass
+            break
+
+    print(f"[live-stream session {session_id}] disconnected")
