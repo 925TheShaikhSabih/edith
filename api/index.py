@@ -485,6 +485,16 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
     # get captured below and used to reconnect seamlessly if the
     # connection is terminated — rather than the previous behavior of
     # just surfacing an error and stopping.
+    # CORRECTION: an earlier version of this config added
+    # transparent=True, based on a doc source that turned out to apply
+    # to a DIFFERENT product tier than what this project actually uses.
+    # Real, confirmed error from Gemini's own server: "transparent
+    # parameter is only supported in Gemini Enterprise Agent Platform
+    # mode, not in Gemini Developer API mode." This project authenticates
+    # via a plain GEMINI_API_KEY — the Developer API — not Enterprise
+    # Agent Platform. Removed transparent=True; the base resumption
+    # mechanism itself (the actual fix for the earlier 1011/1007 session-
+    # lifetime errors) is unaffected and stays in place.
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=LIVE_SYSTEM_INSTRUCTION,
@@ -499,7 +509,7 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(disabled=True)
         ),
-        session_resumption=types.SessionResumptionConfig(transparent=True),
+        session_resumption=types.SessionResumptionConfig(),
     )
 
     # Shared mutable state: _forward_gemini_to_browser writes the latest
@@ -692,7 +702,7 @@ async def websocket_live_stream_endpoint(websocket: WebSocket):
                     speech_config=config.speech_config,
                     realtime_input_config=config.realtime_input_config,
                     session_resumption=types.SessionResumptionConfig(
-                        handle=resumption_state["handle"], transparent=True
+                        handle=resumption_state["handle"]
                     ),
                 )
 

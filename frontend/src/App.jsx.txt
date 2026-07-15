@@ -37,6 +37,30 @@ function useRadialTicks(count, radius) {
 
 const PCM_WORKLET_SOURCE = `
 class PCM16Processor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    // Buffers multiple process() calls before sending, rather than
+    // sending on every single call. The Web Audio spec fixes each
+    // process() call's input to exactly 128 samples (a "render
+    // quantum") — at 16kHz that's 8ms per call, which is SMALLER than
+    // Google's own documented recommendation for Live streaming ("send
+    // small chunks between 20ms and 40ms to minimize latency"). Sending
+    // every single 8ms call as its own WebSocket message means ~4-5x
+    // more messages than necessary for the responsiveness real-time
+    // streaming actually needs. Buffering 4 calls (512 samples = 32ms)
+    // lands inside that documented sweet spot: real savings on message
+    // overhead without pushing latency past what Google's own guidance
+    // calls acceptable for this exact use case. NOT the same as turn-
+    // based mode's much larger buffered-utterance chunks — that would
+    // defeat real-time streaming's entire point (audio reaching Gemini
+    // as it's captured, so it can respond or be interrupted without
+    // waiting for a full utterance) — this is a much smaller, bounded
+    // batch specifically sized to Google's own latency guidance, not an
+    // unbounded buffer.
+    this.chunksToBuffer = 4;
+    this.bufferedChunks = [];
+  }
+
   process(inputs) {
     const input = inputs[0];
     if (input && input[0]) {
@@ -46,7 +70,19 @@ class PCM16Processor extends AudioWorkletProcessor {
         const s = Math.max(-1, Math.min(1, float32[i]));
         int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
       }
-      this.port.postMessage(int16.buffer, [int16.buffer]);
+      this.bufferedChunks.push(int16);
+
+      if (this.bufferedChunks.length >= this.chunksToBuffer) {
+        const totalLength = this.bufferedChunks.reduce((sum, c) => sum + c.length, 0);
+        const combined = new Int16Array(totalLength);
+        let offset = 0;
+        for (const chunk of this.bufferedChunks) {
+          combined.set(chunk, offset);
+          offset += chunk.length;
+        }
+        this.bufferedChunks = [];
+        this.port.postMessage(combined.buffer, [combined.buffer]);
+      }
     }
     return true;
   }

@@ -1730,3 +1730,29 @@ interact oddly with the silence-detection interval (which runs on its
 own separate 100ms timer, unrelated to worklet message timing, so it
 shouldn't be affected — but noted as the thing to watch if anything
 about utterance-boundary timing feels different after this change).
+
+## Real, direct correction: transparent=True was wrong for this API tier
+
+Reported: "Live stream session error: transparent parameter is only
+supported in Gemini Enterprise Agent Platform mode, not in Gemini
+Developer API mode." A clean, unambiguous error straight from Gemini's
+own server, not something requiring investigation — a genuine mistake
+on this project's part: transparent=True was added to
+SessionResumptionConfig based on a doc source whose scope (Enterprise
+Agent Platform) wasn't checked against what this project actually uses
+(a plain GEMINI_API_KEY — the Developer API), a real gap in verification
+before that addition.
+FIX: removed transparent=True from BOTH SessionResumptionConfig call
+sites (the initial connection config and the reconnection-time config).
+The underlying session resumption mechanism itself — capturing
+resumption handles, reconnecting after a go_away signal — is UNCHANGED
+and still in place; only the one unsupported parameter was removed. This
+does not undo the earlier 1011/1007 session-lifetime fix, just corrects
+one parameter that shouldn't have been added to it.
+Lesson, stated plainly: this project has generally been good about
+citing sources and cross-checking claims across multiple documents
+before shipping a fix, but didn't check whether the SPECIFIC PRODUCT
+TIER a given doc page was describing actually matched this project's
+own setup (Developer API vs. Enterprise) — worth treating "which product
+tier does this doc apply to" as its own explicit check going forward,
+not just "is this claim true somewhere."
